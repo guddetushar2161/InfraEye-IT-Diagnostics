@@ -67,6 +67,8 @@ function Get-Config {
 # SEND EMAIL ALERT
 # ─────────────────────────────────────────────────────────────────────────────
 function Send-AlertEmail {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '',
+        Justification = 'Password is read from an external config file, not hardcoded in source.')]
     param(
         [string]$Subject,
         [string]$Body,

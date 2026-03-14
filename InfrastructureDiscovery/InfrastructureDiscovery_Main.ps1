@@ -55,6 +55,17 @@ function Write-Log {
 # DEPENDENCY CHECK
 # ─────────────────────────────────────────────────────────────────────────────
 function Install-RequiredModules {
+    # Ensure NuGet provider is available for Install-Module
+    if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
+        Write-Log "NuGet package provider not found. Installing..." "WARN"
+        try {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null
+            Write-Log "NuGet provider installed successfully." "SUCCESS"
+        } catch {
+            Write-Log "Failed to install NuGet provider: $_" "WARN"
+        }
+    }
+
     $modules = @("ImportExcel", "PSWriteHTML")
     foreach ($mod in $modules) {
         if (-not (Get-Module -ListAvailable -Name $mod)) {
@@ -115,38 +126,46 @@ function Invoke-PingSweep {
     $octets = $baseIP -split '\.'
     $prefix = "$($octets[0]).$($octets[1]).$($octets[2])"
 
-    $config      = Get-Content -Path $ConfigFile -Raw | ConvertFrom-Json
-    $timeout     = $config.network_scan.ping_timeout_ms
-    $maxThreads  = $config.network_scan.max_threads
+    $config     = Get-Content -Path $ConfigFile -Raw | ConvertFrom-Json
+    $timeout    = $config.network_scan.ping_timeout_ms
+    $maxThreads = $config.network_scan.max_threads
 
-    $aliveHosts = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+    # Use a RunspacePool for reliable parallel pinging in PowerShell
+    $runspacePool = [RunspaceFactory]::CreateRunspacePool(1, $maxThreads)
+    $runspacePool.Open()
 
-    $throttle = [System.Threading.SemaphoreSlim]::new($maxThreads, $maxThreads)
-    $tasks    = @()
-
-    1..254 | ForEach-Object {
-        $ip = "$prefix.$_"
-        $throttle.Wait()
-        $task = [System.Threading.Tasks.Task]::Run([scriptblock]{
-            param($targetIP, $tout, $bag, $sem)
-            try {
-                $ping  = New-Object System.Net.NetworkInformation.Ping
-                $reply = $ping.Send($targetIP, $tout)
-                $ping.Dispose()
-                if ($reply.Status -eq "Success") {
-                    $bag.Add($targetIP)
-                }
-            } catch { }
-            finally { $sem.Release() | Out-Null }
-        }, @($ip, $timeout, $aliveHosts, $throttle))
-        $tasks += $task
+    $pingScript = {
+        param([string]$TargetIP, [int]$Timeout)
+        try {
+            $ping  = New-Object System.Net.NetworkInformation.Ping
+            $reply = $ping.Send($TargetIP, $Timeout)
+            $ping.Dispose()
+            if ($reply.Status -eq 'Success') { return $TargetIP }
+        } catch { }
+        return $null
     }
 
-    [System.Threading.Tasks.Task]::WaitAll($tasks)
+    $jobs = @()
+    1..254 | ForEach-Object {
+        $ip = "$prefix.$_"
+        $ps = [PowerShell]::Create()
+        $ps.RunspacePool = $runspacePool
+        [void]$ps.AddScript($pingScript).AddArgument($ip).AddArgument($timeout)
+        $jobs += [PSCustomObject]@{ PS = $ps; Handle = $ps.BeginInvoke() }
+    }
 
-    $result = $aliveHosts.ToArray() | Sort-Object { [System.Version]$_ }
-    Write-Log "Ping sweep complete. Found $($result.Count) live hosts in $NetworkCIDR" "INFO"
-    return $result
+    $aliveHosts = [System.Collections.Generic.List[string]]::new()
+    foreach ($job in $jobs) {
+        $result = $job.PS.EndInvoke($job.Handle)
+        if ($result) { $aliveHosts.Add($result) }
+        $job.PS.Dispose()
+    }
+    $runspacePool.Close()
+    $runspacePool.Dispose()
+
+    $sortedHosts = @($aliveHosts | Sort-Object { [System.Version]$_ })
+    Write-Log "Ping sweep complete. Found $($sortedHosts.Count) live hosts in $NetworkCIDR" "INFO"
+    return $sortedHosts
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -177,8 +196,8 @@ function Get-ARPTable {
 function Resolve-HostnameForIP {
     param([string]$IPAddress)
     try {
-        $host = [System.Net.Dns]::GetHostEntry($IPAddress)
-        return $host.HostName
+        $hostEntry = [System.Net.Dns]::GetHostEntry($IPAddress)
+        return $hostEntry.HostName
     } catch {
         return $IPAddress
     }

@@ -28,7 +28,6 @@ if (!(Test-Path $LogDir))    { New-Item -ItemType Directory -Path $LogDir    | O
 $Timestamp    = Get-Date -Format "yyyyMMdd_HHmmss"
 $LogFile      = Join-Path $LogDir "DeviceHealth_$Timestamp.log"
 $ReportFile   = Join-Path $ReportDir "DeviceHealth_$Timestamp.html"
-$ConfigFile   = Join-Path $PSScriptRoot "..\config.json"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -53,6 +52,17 @@ function Write-Log {
 # DEPENDENCY CHECK
 # ─────────────────────────────────────────────────────────────────────────────
 function Install-RequiredModules {
+    # Ensure NuGet provider is available for Install-Module
+    if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
+        Write-Log "NuGet package provider not found. Installing..." "WARN"
+        try {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null
+            Write-Log "NuGet provider installed successfully." "SUCCESS"
+        } catch {
+            Write-Log "Failed to install NuGet provider: $_" "WARN"
+        }
+    }
+
     $modules = @("ImportExcel", "PSWriteHTML")
     foreach ($mod in $modules) {
         if (-not (Get-Module -ListAvailable -Name $mod)) {
@@ -413,8 +423,8 @@ function New-HtmlReport {
     foreach ($s in $StartupApps) {
         $startupRowsHtml += @"
             <tr>
-                <td>$([System.Web.HttpUtility]::HtmlEncode($s.Name))</td>
-                <td style='font-size:0.8em;word-break:break-all;'>$([System.Web.HttpUtility]::HtmlEncode($s.Command))</td>
+                <td>$([System.Net.WebUtility]::HtmlEncode($s.Name))</td>
+                <td style='font-size:0.8em;word-break:break-all;'>$([System.Net.WebUtility]::HtmlEncode($s.Command))</td>
                 <td>$($s.Source)</td>
             </tr>
 "@
