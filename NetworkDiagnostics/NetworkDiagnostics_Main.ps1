@@ -28,7 +28,6 @@ if (!(Test-Path $LogDir))    { New-Item -ItemType Directory -Path $LogDir    | O
 $Timestamp  = Get-Date -Format "yyyyMMdd_HHmmss"
 $LogFile    = Join-Path $LogDir "NetworkDiagnostics_$Timestamp.log"
 $ReportFile = Join-Path $ReportDir "NetworkDiagnostics_$Timestamp.html"
-$ConfigFile = Join-Path $PSScriptRoot "..\config.json"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -53,6 +52,17 @@ function Write-Log {
 # DEPENDENCY CHECK
 # ─────────────────────────────────────────────────────────────────────────────
 function Install-RequiredModules {
+    # Ensure NuGet provider is available for Install-Module
+    if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
+        Write-Log "NuGet package provider not found. Installing..." "WARN"
+        try {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null
+            Write-Log "NuGet provider installed successfully." "SUCCESS"
+        } catch {
+            Write-Log "Failed to install NuGet provider: $_" "WARN"
+        }
+    }
+
     $modules = @("ImportExcel", "PSWriteHTML")
     foreach ($mod in $modules) {
         if (-not (Get-Module -ListAvailable -Name $mod)) {
@@ -135,7 +145,7 @@ function Get-PublicIPInfo {
     }
 }
 
-function Run-PingTest {
+function Invoke-PingTest {
     param([string[]]$Targets = @("8.8.8.8","1.1.1.1","8.8.4.4"))
     Write-Log "Running ping tests to: $($Targets -join ', ')..." "INFO"
     $results = @()
@@ -184,7 +194,7 @@ function Run-PingTest {
     return $results
 }
 
-function Run-SpeedTest {
+function Invoke-SpeedTest {
     Write-Log "Estimating download speed..." "INFO"
     try {
         $url        = "http://speedtest.tele2.net/10MB.zip"
@@ -246,7 +256,7 @@ function Get-NetworkUsage {
     return $netProcesses
 }
 
-function Analyze-NetworkIssues {
+function Get-NetworkIssueAnalysis {
     param(
         [array]$Adapters,
         [PSCustomObject]$PublicIP,
@@ -566,10 +576,10 @@ try {
 
     $adapterInfo   = Get-NetworkAdapterInfo
     $publicIPInfo  = Get-PublicIPInfo
-    $pingResults   = Run-PingTest -Targets @("8.8.8.8","1.1.1.1","8.8.4.4")
-    $speedTest     = Run-SpeedTest
+    $pingResults   = Invoke-PingTest -Targets @("8.8.8.8","1.1.1.1","8.8.4.4")
+    $speedTest     = Invoke-SpeedTest
     $netProcesses  = Get-NetworkUsage
-    $netIssues     = Analyze-NetworkIssues `
+    $netIssues     = Get-NetworkIssueAnalysis `
                         -Adapters    $adapterInfo `
                         -PublicIP    $publicIPInfo `
                         -PingResults $pingResults `
