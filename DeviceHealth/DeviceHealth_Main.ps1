@@ -171,6 +171,25 @@ function Get-DiskInfo {
     Write-Log "Collecting disk data..." "INFO"
     $disks = @()
     try {
+        $physicalDiskTypeByNumber = @{}
+        try {
+            $physicalDisks = @(Get-PhysicalDisk -ErrorAction Stop)
+            foreach ($physicalDisk in $physicalDisks) {
+                $diskMatch = Get-Disk -FriendlyName $physicalDisk.FriendlyName -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($diskMatch) {
+                    $physicalDiskTypeByNumber[$diskMatch.Number] = if ($physicalDisk.MediaType) {
+                        [string]$physicalDisk.MediaType
+                    } elseif ($physicalDisk.SpindleSpeed -eq 0 -or $physicalDisk.BusType -match "NVMe") {
+                        "SSD"
+                    } else {
+                        "Unknown"
+                    }
+                }
+            }
+        } catch {
+            Write-Log "Modern physical disk metadata unavailable. Falling back to legacy disk detection." "WARN"
+        }
+
         $logicalDisks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3"
         foreach ($disk in $logicalDisks) {
             $totalGB = [math]::Round($disk.Size / 1GB, 2)
@@ -178,19 +197,39 @@ function Get-DiskInfo {
             $usedGB  = [math]::Round($totalGB - $freeGB, 2)
             $freePct = if ($totalGB -gt 0) { [math]::Round(($freeGB / $totalGB) * 100, 1) } else { 0 }
 
-            # Detect SSD or HDD via Win32_DiskDrive
+            # Detect SSD/HDD using modern storage APIs first, then fall back to legacy WMI.
             $diskType = "Unknown"
             try {
-                $partition = Get-CimInstance -Query "ASSOCIATORS OF {Win32_LogicalDisk.DeviceID='$($disk.DeviceID)'} WHERE AssocClass=Win32_LogicalDiskToPartition"
-                if ($partition) {
-                    $drive = Get-CimInstance -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$($partition[0].DeviceID)'} WHERE AssocClass=Win32_DiskDriveToDiskPartition"
-                    if ($drive) {
-                        $mediaType = $drive[0].MediaType
-                        if ($mediaType -match "SSD|Solid") { $diskType = "SSD" }
-                        elseif ($mediaType -match "Fixed|HDD") { $diskType = "HDD" }
-                        else {
-                            # Try model name heuristic
-                            $diskType = if ($drive[0].Model -match "SSD|NVMe|M\.2") { "SSD" } else { "HDD" }
+                $driveLetter = $disk.DeviceID.TrimEnd(':')
+                $partitionInfo = Get-Partition -DriveLetter $driveLetter -ErrorAction SilentlyContinue
+                if ($partitionInfo) {
+                    $diskInfo = $partitionInfo | Get-Disk -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($diskInfo) {
+                        if ($physicalDiskTypeByNumber.ContainsKey($diskInfo.Number)) {
+                            $diskType = $physicalDiskTypeByNumber[$diskInfo.Number]
+                        } elseif ($diskInfo.BusType -match "NVMe") {
+                            $diskType = "SSD"
+                        } elseif ($diskInfo.MediaType) {
+                            $diskType = [string]$diskInfo.MediaType
+                        }
+                    }
+                }
+
+                if ($diskType -eq "Unspecified") {
+                    $diskType = "Unknown"
+                }
+
+                if ($diskType -eq "Unknown") {
+                    $partition = Get-CimInstance -Query "ASSOCIATORS OF {Win32_LogicalDisk.DeviceID='$($disk.DeviceID)'} WHERE AssocClass=Win32_LogicalDiskToPartition"
+                    if ($partition) {
+                        $drive = Get-CimInstance -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$($partition[0].DeviceID)'} WHERE AssocClass=Win32_DiskDriveToDiskPartition"
+                        if ($drive) {
+                            $model = [string]$drive[0].Model
+                            if ($model -match "SSD|NVMe|M\.2") {
+                                $diskType = "SSD"
+                            } elseif ($drive[0].MediaType -match "Fixed|HDD|Hard") {
+                                $diskType = "HDD"
+                            }
                         }
                     }
                 }
