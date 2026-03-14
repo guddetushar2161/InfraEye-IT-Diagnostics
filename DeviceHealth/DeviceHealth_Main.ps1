@@ -434,55 +434,180 @@ function Get-StartupPrograms {
     return $startupItems
 }
 
+function Get-TopProcesses {
+    param([int]$TopN = 15)
+    Write-Log "Collecting top resource-consuming processes..." "INFO"
+    $rows = @()
+    try {
+        $processes = @(Get-Process -ErrorAction SilentlyContinue)
+        foreach ($proc in $processes) {
+            $rows += [PSCustomObject]@{
+                Name      = $proc.ProcessName
+                PID       = $proc.Id
+                MemoryMB  = [math]::Round($proc.WorkingSet64 / 1MB, 1)
+                CPU_s     = [math]::Round($proc.CPU, 1)
+                Handles   = $proc.Handles
+                Threads   = $proc.Threads.Count
+            }
+        }
+    } catch {
+        Write-Log "Could not enumerate process metrics: $_" "WARN"
+    }
+
+    if ($rows.Count -eq 0) { return @() }
+    return @($rows | Sort-Object -Property MemoryMB -Descending | Select-Object -First $TopN)
+}
+
 function Get-PerformanceAnalysis {
     param(
         [PSCustomObject]$CPU,
         [PSCustomObject]$RAM,
         [array]$Disks,
         [array]$StartupApps,
-        [array]$Temperatures = @()
+        [array]$Temperatures = @(),
+        [array]$TopProcesses = @()
     )
     Write-Log "Performing performance analysis..." "INFO"
     $issues = @()
+    $processCount = (Get-Process).Count
+    $maxTemp = if ($Temperatures.Count -gt 0) { ($Temperatures | Measure-Object -Property TempC -Maximum).Maximum } else { $null }
+
+    $slowdownScore = 0
+    if ($CPU.UsagePercent -gt 85) { $slowdownScore += 35 }
+    if ($RAM.UsedPercent -gt 85) { $slowdownScore += 35 }
+    if ($processCount -gt 180) { $slowdownScore += 15 }
+    if ($StartupApps.Count -gt 15) { $slowdownScore += 10 }
+    if (@($Disks | Where-Object { $_.FreePercent -lt 10 }).Count -gt 0) { $slowdownScore += 20 }
+    if ($null -ne $maxTemp -and $maxTemp -ge 80) { $slowdownScore += 25 }
+
+    $slowIndicators = @()
+    if ($CPU.UsagePercent -gt 85) { $slowIndicators += "CPU saturation ($($CPU.UsagePercent)%)" }
+    if ($RAM.UsedPercent -gt 85) { $slowIndicators += "memory pressure ($($RAM.UsedPercent)%)" }
+    if ($processCount -gt 180) { $slowIndicators += "high process count ($processCount)" }
+    if ($StartupApps.Count -gt 15) { $slowIndicators += "heavy startup load ($($StartupApps.Count) items)" }
+    $criticalDisks = @($Disks | Where-Object { $_.FreePercent -lt 10 } | ForEach-Object { "$($_.Drive) free $($_.FreePercent)%" })
+    if ($criticalDisks.Count -gt 0) { $slowIndicators += "low disk free space ($($criticalDisks -join '; '))" }
+    if ($null -ne $maxTemp -and $maxTemp -ge 80) { $slowIndicators += "thermal throttling risk ($maxTemp °C)" }
+
+    if ($slowdownScore -ge 40) {
+        $issues += [PSCustomObject]@{
+            Issue          = "System Slowdown Risk"
+            Severity       = if ($slowdownScore -ge 70) { "HIGH" } else { "MEDIUM" }
+            Detail         = "Measured slowdown risk score: $slowdownScore/140. Indicators: $($slowIndicators -join ', ')."
+            RootCause      = "Performance bottlenecks are cumulative. Multiple medium stressors (CPU, RAM, startup load, thermals, disk pressure) combine to create visible lag."
+            Recommendation = "Prioritize top memory/CPU processes, reduce startup items, keep >15% free space on system drive, and address cooling if temperature is high."
+        }
+    }
 
     if ($RAM.TotalGB -lt 8) {
-        $issues += [PSCustomObject]@{ Issue = "Low RAM"; Severity = "HIGH"; Detail = "Only $($RAM.TotalGB) GB RAM installed. Minimum 8 GB recommended." }
+        $issues += [PSCustomObject]@{
+            Issue          = "Low RAM Capacity"
+            Severity       = "HIGH"
+            Detail         = "Installed RAM is $($RAM.TotalGB) GB, below modern multitasking baseline."
+            RootCause      = "Insufficient physical memory forces frequent paging to disk, causing app switching lag and stutter."
+            Recommendation = "Upgrade to at least 16 GB RAM for smoother multitasking and lower disk paging pressure."
+        }
     }
     if ($CPU.UsagePercent -gt 85) {
-        $issues += [PSCustomObject]@{ Issue = "High CPU Usage"; Severity = "HIGH"; Detail = "CPU at $($CPU.UsagePercent)%. System may be overloaded." }
+        $issues += [PSCustomObject]@{
+            Issue          = "High CPU Usage"
+            Severity       = "HIGH"
+            Detail         = "CPU usage is $($CPU.UsagePercent)% during capture."
+            RootCause      = "One or more workloads are saturating CPU cores, increasing response time for interactive tasks."
+            Recommendation = "Identify top CPU processes from Task Manager/Process Explorer, close non-essential background tasks, and check for scheduled scans/updates."
+        }
     }
     foreach ($d in $Disks) {
         if ($d.FreePercent -lt 10) {
-            $issues += [PSCustomObject]@{ Issue = "Disk Bottleneck"; Severity = "HIGH"; Detail = "Drive $($d.Drive) has only $($d.FreePercent)% free space." }
+            $issues += [PSCustomObject]@{
+                Issue          = "Disk Space Bottleneck"
+                Severity       = "HIGH"
+                Detail         = "Drive $($d.Drive) has only $($d.FreePercent)% free space."
+                RootCause      = "Low free space reduces filesystem efficiency, update/cache behavior, and can increase write amplification."
+                Recommendation = "Free 15-20% space on $($d.Drive), clear temp files, move large archives/media, and uninstall unused software."
+            }
         }
         if ($d.DiskType -eq "HDD") {
-            $issues += [PSCustomObject]@{ Issue = "HDD Detected"; Severity = "MEDIUM"; Detail = "Drive $($d.Drive) is an HDD. Upgrading to SSD will significantly improve performance." }
+            $issues += [PSCustomObject]@{
+                Issue          = "HDD Performance Constraint"
+                Severity       = "MEDIUM"
+                Detail         = "Drive $($d.Drive) is detected as HDD."
+                RootCause      = "Mechanical seek latency is significantly higher than SSD, slowing boot, app launch, and random I/O-heavy tasks."
+                Recommendation = "Migrate OS and frequently used apps to SSD/NVMe for major responsiveness gains."
+            }
         }
     }
-    $processCount = (Get-Process).Count
     if ($processCount -gt 150) {
-        $issues += [PSCustomObject]@{ Issue = "Too Many Processes"; Severity = "MEDIUM"; Detail = "$processCount processes running. Consider terminating unused processes." }
+        $issues += [PSCustomObject]@{
+            Issue          = "Excessive Background Processes"
+            Severity       = "MEDIUM"
+            Detail         = "$processCount processes are running."
+            RootCause      = "Excess startup and background services increase scheduler overhead, RAM footprint, and contention for CPU time."
+            Recommendation = "Disable non-essential startup apps/services, uninstall unused software, and review scheduled tasks that spawn background agents."
+        }
     }
     if ($StartupApps.Count -gt 10) {
         $severity = if ($StartupApps.Count -gt 20) { "HIGH" } else { "MEDIUM" }
-        $issues += [PSCustomObject]@{ Issue = "Too Many Startup Programs"; Severity = $severity; Detail = "$($StartupApps.Count) startup apps detected. Reduce to improve boot time." }
+        $issues += [PSCustomObject]@{
+            Issue          = "Heavy Startup Load"
+            Severity       = $severity
+            Detail         = "$($StartupApps.Count) startup apps detected."
+            RootCause      = "Too many autorun entries delay logon initialization and keep persistent background footprint after boot."
+            Recommendation = "Keep startup entries below 10 where possible. Disable low-value autoruns from Task Manager > Startup or Autoruns utility."
+        }
     }
     if ($RAM.UsedPercent -gt 85) {
-        $issues += [PSCustomObject]@{ Issue = "High RAM Usage"; Severity = "HIGH"; Detail = "RAM usage at $($RAM.UsedPercent)%. System may be memory-constrained." }
+        $topRam = @($TopProcesses | Sort-Object MemoryMB -Descending | Select-Object -First 5)
+        $topRamSummary = if ($topRam.Count -gt 0) {
+            ($topRam | ForEach-Object { "$($_.Name) ($($_.MemoryMB) MB)" }) -join ", "
+        } else {
+            "Top process data unavailable"
+        }
+        $issues += [PSCustomObject]@{
+            Issue          = "High RAM Usage"
+            Severity       = "HIGH"
+            Detail         = "RAM usage is $($RAM.UsedPercent)% ($($RAM.UsedGB) GB used of $($RAM.TotalGB) GB). Top consumers: $topRamSummary."
+            RootCause      = "One or more applications are keeping large working sets, increasing paging and reducing responsiveness."
+            Recommendation = "Close/restart the highest-memory processes listed below, update memory-heavy apps, and consider a RAM upgrade if high usage is persistent."
+        }
     }
 
     foreach ($zone in $Temperatures) {
         if ($zone.TempC -ge 90) {
-            $issues += [PSCustomObject]@{ Issue = "Critical Temperature"; Severity = "HIGH"; Detail = "$($zone.ZoneName) is at $($zone.TempC)°C. Immediate cooling action required." }
+            $issues += [PSCustomObject]@{
+                Issue          = "Critical Temperature"
+                Severity       = "HIGH"
+                Detail         = "$($zone.ZoneName) is at $($zone.TempC)°C."
+                RootCause      = "Thermal headroom is exhausted and CPU/GPU may throttle to prevent damage, which directly slows performance."
+                Recommendation = "Clean vents/fans, improve airflow, reduce heavy workloads temporarily, and verify fan curve or thermal paste condition."
+            }
         } elseif ($zone.TempC -ge 80) {
-            $issues += [PSCustomObject]@{ Issue = "High Temperature"; Severity = "HIGH"; Detail = "$($zone.ZoneName) is at $($zone.TempC)°C. Check cooling system." }
+            $issues += [PSCustomObject]@{
+                Issue          = "High Temperature"
+                Severity       = "HIGH"
+                Detail         = "$($zone.ZoneName) is at $($zone.TempC)°C."
+                RootCause      = "Sustained high temperature reduces boost clocks and can trigger thermal throttling."
+                Recommendation = "Check fan operation, remove dust buildup, ensure unobstructed airflow, and reduce simultaneous CPU+GPU load."
+            }
         } elseif ($zone.TempC -ge 65) {
-            $issues += [PSCustomObject]@{ Issue = "Elevated Temperature"; Severity = "MEDIUM"; Detail = "$($zone.ZoneName) is running warm at $($zone.TempC)°C. Monitor closely." }
+            $issues += [PSCustomObject]@{
+                Issue          = "Elevated Temperature"
+                Severity       = "MEDIUM"
+                Detail         = "$($zone.ZoneName) is running warm at $($zone.TempC)°C."
+                RootCause      = "Thermal load is above ideal baseline; prolonged operation can reduce sustained performance."
+                Recommendation = "Monitor trend during heavy workloads and optimize cooling profile if temperature frequently rises further."
+            }
         }
     }
 
     if ($issues.Count -eq 0) {
-        $issues += [PSCustomObject]@{ Issue = "No Issues Detected"; Severity = "OK"; Detail = "System appears healthy." }
+        $issues += [PSCustomObject]@{
+            Issue          = "No Issues Detected"
+            Severity       = "OK"
+            Detail         = "No major performance bottlenecks were detected in this snapshot."
+            RootCause      = "System metrics are currently within healthy operating ranges."
+            Recommendation = "Keep drivers/OS updated and rerun diagnostics during peak usage if intermittent lag occurs."
+        }
     }
     return $issues
 }
@@ -501,7 +626,8 @@ function New-HtmlReport {
         [PSCustomObject]$Battery,
         [array]$StartupApps,
         [array]$PerfIssues,
-        [array]$Temperatures = @()
+        [array]$Temperatures = @(),
+        [array]$TopProcesses = @()
     )
 
     $reportDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -558,8 +684,28 @@ function New-HtmlReport {
                 <td><span style='background:$sevColor;color:#fff;padding:2px 10px;border-radius:12px;font-size:0.8em;'>$($p.Severity)</span></td>
                 <td>$($p.Issue)</td>
                 <td>$($p.Detail)</td>
+                <td>$($p.RootCause)</td>
+                <td>$($p.Recommendation)</td>
             </tr>
 "@
+    }
+
+    $processRowsHtml = ""
+    foreach ($proc in ($TopProcesses | Sort-Object MemoryMB -Descending)) {
+        $ramColorProc = if ($proc.MemoryMB -ge 1000) { "#dc3545" } elseif ($proc.MemoryMB -ge 500) { "#ffc107" } else { "#28a745" }
+        $processRowsHtml += @"
+            <tr>
+                <td>$([System.Net.WebUtility]::HtmlEncode($proc.Name))</td>
+                <td>$($proc.PID)</td>
+                <td style='font-weight:700;color:$ramColorProc;'>$($proc.MemoryMB) MB</td>
+                <td>$($proc.CPU_s)</td>
+                <td>$($proc.Handles)</td>
+                <td>$($proc.Threads)</td>
+            </tr>
+"@
+    }
+    if (-not $processRowsHtml) {
+        $processRowsHtml = "<tr><td colspan='6' style='text-align:center;color:#6c757d;'>Process data unavailable.</td></tr>"
     }
 
     $cpuColor  = if ($CPU.UsagePercent -gt 90) { "#dc3545" } elseif ($CPU.UsagePercent -gt 70) { "#ffc107" } else { "#28a745" }
@@ -798,8 +944,18 @@ function New-HtmlReport {
     <div class="section">
         <h2>&#x1F50D; Performance Root Cause Analysis</h2>
         <table>
-            <thead><tr><th>Severity</th><th>Issue</th><th>Details</th></tr></thead>
+            <thead><tr><th>Severity</th><th>Issue</th><th>Details</th><th>Why It Happens</th><th>What To Do</th></tr></thead>
             <tbody>$perfRowsHtml</tbody>
+        </table>
+    </div>
+
+    <!-- Top RAM Processes -->
+    <div class="section">
+        <h2>&#x1F9E0; Top RAM Consumers (Slowdown/Heat Contributors)</h2>
+        $(if($RAM.UsedPercent -ge 80){"<p style='color:#dc3545;margin-bottom:12px;'>&#x26A0; High memory pressure detected. Prioritize the highest RAM consumers below.</p>"}else{"<p style='color:#6c757d;margin-bottom:12px;'>Memory usage is currently manageable. This list still helps identify heavy background apps.</p>"})
+        <table>
+            <thead><tr><th>Process</th><th>PID</th><th>RAM (MB)</th><th>CPU Time (s)</th><th>Handles</th><th>Threads</th></tr></thead>
+            <tbody>$processRowsHtml</tbody>
         </table>
     </div>
 
@@ -932,8 +1088,9 @@ try {
     $gpuInfo     = Get-GPUInfo
     $batteryInfo = Get-BatteryInfo
     $startupApps = @(Get-StartupPrograms)
+    $topProcesses = @(Get-TopProcesses -TopN 15)
     $tempInfo    = @(Get-TemperatureInfo)
-    $perfIssues  = Get-PerformanceAnalysis -CPU $cpuInfo -RAM $ramInfo -Disks $diskInfo -StartupApps $startupApps -Temperatures $tempInfo
+    $perfIssues  = Get-PerformanceAnalysis -CPU $cpuInfo -RAM $ramInfo -Disks $diskInfo -StartupApps $startupApps -Temperatures $tempInfo -TopProcesses $topProcesses
 
     Write-Log "Generating HTML report..." "INFO"
     $htmlContent = New-HtmlReport `
@@ -946,7 +1103,8 @@ try {
         -Battery       $batteryInfo `
         -StartupApps   $startupApps `
         -PerfIssues    $perfIssues `
-        -Temperatures  $tempInfo
+        -Temperatures  $tempInfo `
+        -TopProcesses  $topProcesses
 
     $htmlContent | Out-File -FilePath $ReportFile -Encoding UTF8 -Force
     Write-Log "Report saved: $ReportFile" "SUCCESS"
