@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     InfraEye - Device Health Diagnostics Module
@@ -527,9 +527,9 @@ function New-HtmlReport {
                       elseif ($maxTempC -ge 65) { "#ffc107" }
                       else { "#28a745" }
     $tempCardSub    = if ($null -eq $maxTempC) { "No sensor data available" }
-                      elseif ($maxTempC -ge 90) { "CRITICAL — check cooling!" }
-                      elseif ($maxTempC -ge 80) { "Hot — check cooling system" }
-                      elseif ($maxTempC -ge 65) { "Warm — monitor closely" }
+                      elseif ($maxTempC -ge 90) { "CRITICAL - check cooling!" }
+                      elseif ($maxTempC -ge 80) { "Hot - check cooling system" }
+                      elseif ($maxTempC -ge 65) { "Warm - monitor closely" }
                       else { "Normal operating range" }
 
     # Temperature table rows
