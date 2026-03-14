@@ -413,8 +413,8 @@ function New-HtmlReport {
     foreach ($s in $StartupApps) {
         $startupRowsHtml += @"
             <tr>
-                <td>$([System.Web.HttpUtility]::HtmlEncode($s.Name))</td>
-                <td style='font-size:0.8em;word-break:break-all;'>$([System.Web.HttpUtility]::HtmlEncode($s.Command))</td>
+                <td>$([System.Net.WebUtility]::HtmlEncode($s.Name))</td>
+                <td style='font-size:0.8em;word-break:break-all;'>$([System.Net.WebUtility]::HtmlEncode($s.Command))</td>
                 <td>$($s.Source)</td>
             </tr>
 "@
