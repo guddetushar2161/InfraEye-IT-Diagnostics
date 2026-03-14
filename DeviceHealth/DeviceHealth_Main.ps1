@@ -278,6 +278,69 @@ function Get-BatteryInfo {
     }
 }
 
+function Get-TemperatureInfo {
+    Write-Log "Collecting temperature data..." "INFO"
+    $zones = @()
+    try {
+        $thermalZones = Get-CimInstance -Namespace "root/WMI" -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue
+        if ($thermalZones) {
+            foreach ($zone in $thermalZones) {
+                $tempCelsius = [math]::Round(($zone.CurrentTemperature / 10) - 273.15, 1)
+                $zoneName = if ($zone.InstanceName -match "ThermalZone(\d+)") {
+                    "Thermal Zone $($Matches[1])"
+                } elseif ($zone.InstanceName -match "_TZ\.(\w+)") {
+                    $Matches[1]
+                } else {
+                    # Extract the last non-numeric path component as a friendly name
+                    ($zone.InstanceName -split '\\' | Where-Object { $_ -match '\D' } | Select-Object -Last 1) -replace '_\d+$', ''
+                }
+                $status = if ($tempCelsius -ge 90) { "Critical" }
+                          elseif ($tempCelsius -ge 80) { "Hot" }
+                          elseif ($tempCelsius -ge 65) { "Warm" }
+                          else { "Normal" }
+                $zones += [PSCustomObject]@{
+                    ZoneName   = $zoneName
+                    TempC      = $tempCelsius
+                    Status     = $status
+                }
+            }
+        }
+    } catch {
+        Write-Log "Could not read thermal zone temperatures: $_" "WARN"
+    }
+
+    # Try Win32_TemperatureProbe as a secondary source (rarely populated but worth trying)
+    if ($zones.Count -eq 0) {
+        try {
+            $probes = Get-CimInstance -ClassName Win32_TemperatureProbe -ErrorAction SilentlyContinue
+            if ($probes) {
+                foreach ($p in $probes) {
+                    # CurrentReading is in tenths of Kelvin; null or zero indicates no valid reading
+                    if ($null -ne $p.CurrentReading -and $p.CurrentReading -ne 0) {
+                        $tempCelsius = [math]::Round(($p.CurrentReading / 10) - 273.15, 1)
+                        $status = if ($tempCelsius -ge 90) { "Critical" }
+                                  elseif ($tempCelsius -ge 80) { "Hot" }
+                                  elseif ($tempCelsius -ge 65) { "Warm" }
+                                  else { "Normal" }
+                        $zones += [PSCustomObject]@{
+                            ZoneName = if ($p.Name) { $p.Name } else { "Temperature Probe" }
+                            TempC    = $tempCelsius
+                            Status   = $status
+                        }
+                    }
+                }
+            }
+        } catch {
+            Write-Log "Could not read temperature probes: $_" "WARN"
+        }
+    }
+
+    if ($zones.Count -eq 0) {
+        Write-Log "No temperature sensors accessible via WMI on this system." "WARN"
+    }
+    return $zones
+}
+
 function Get-StartupPrograms {
     Write-Log "Collecting startup programs..." "INFO"
     $startupItems = @()
@@ -327,7 +390,8 @@ function Get-PerformanceAnalysis {
         [PSCustomObject]$CPU,
         [PSCustomObject]$RAM,
         [array]$Disks,
-        [array]$StartupApps
+        [array]$StartupApps,
+        [array]$Temperatures = @()
     )
     Write-Log "Performing performance analysis..." "INFO"
     $issues = @()
@@ -358,6 +422,16 @@ function Get-PerformanceAnalysis {
         $issues += [PSCustomObject]@{ Issue = "High RAM Usage"; Severity = "HIGH"; Detail = "RAM usage at $($RAM.UsedPercent)%. System may be memory-constrained." }
     }
 
+    foreach ($zone in $Temperatures) {
+        if ($zone.TempC -ge 90) {
+            $issues += [PSCustomObject]@{ Issue = "Critical Temperature"; Severity = "HIGH"; Detail = "$($zone.ZoneName) is at $($zone.TempC)°C. Immediate cooling action required." }
+        } elseif ($zone.TempC -ge 80) {
+            $issues += [PSCustomObject]@{ Issue = "High Temperature"; Severity = "HIGH"; Detail = "$($zone.ZoneName) is at $($zone.TempC)°C. Check cooling system." }
+        } elseif ($zone.TempC -ge 65) {
+            $issues += [PSCustomObject]@{ Issue = "Elevated Temperature"; Severity = "MEDIUM"; Detail = "$($zone.ZoneName) is running warm at $($zone.TempC)°C. Monitor closely." }
+        }
+    }
+
     if ($issues.Count -eq 0) {
         $issues += [PSCustomObject]@{ Issue = "No Issues Detected"; Severity = "OK"; Detail = "System appears healthy." }
     }
@@ -377,7 +451,8 @@ function New-HtmlReport {
         [array]$GPUs,
         [PSCustomObject]$Battery,
         [array]$StartupApps,
-        [array]$PerfIssues
+        [array]$PerfIssues,
+        [array]$Temperatures = @()
     )
 
     $reportDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -442,6 +517,64 @@ function New-HtmlReport {
     $ramColor  = if ($RAM.UsedPercent  -gt 90) { "#dc3545" } elseif ($RAM.UsedPercent  -gt 70) { "#ffc107" } else { "#28a745" }
     $diskFreeMin = if ($Disks.Count -gt 0) { ($Disks | Measure-Object -Property FreePercent -Minimum).Minimum } else { 100 }
     $diskColor = if ($diskFreeMin -lt 10) { "#dc3545" } elseif ($diskFreeMin -lt 20) { "#ffc107" } else { "#28a745" }
+
+    # Temperature summary values
+    $maxTempC       = if ($Temperatures.Count -gt 0) { ($Temperatures | Measure-Object -Property TempC -Maximum).Maximum } else { $null }
+    $tempCardValue  = if ($null -ne $maxTempC) { "$maxTempC °C" } else { "N/A" }
+    $tempCardColor  = if ($null -eq $maxTempC) { "#6c757d" }
+                      elseif ($maxTempC -ge 90) { "#a71d2a" }
+                      elseif ($maxTempC -ge 80) { "#dc3545" }
+                      elseif ($maxTempC -ge 65) { "#ffc107" }
+                      else { "#28a745" }
+    $tempCardSub    = if ($null -eq $maxTempC) { "No sensor data available" }
+                      elseif ($maxTempC -ge 90) { "CRITICAL — check cooling!" }
+                      elseif ($maxTempC -ge 80) { "Hot — check cooling system" }
+                      elseif ($maxTempC -ge 65) { "Warm — monitor closely" }
+                      else { "Normal operating range" }
+
+    # Temperature table rows
+    # Bar width: scale so 120 °C maps to 100% (capped at 100% to handle any outliers)
+    $tempBarMaxScale = 120
+    $tempRowsHtml = ""
+    if ($Temperatures.Count -gt 0) {
+        foreach ($t in ($Temperatures | Sort-Object TempC -Descending)) {
+            $tColor = if ($t.TempC -ge 90) { "#a71d2a" }
+                      elseif ($t.TempC -ge 80) { "#dc3545" }
+                      elseif ($t.TempC -ge 65) { "#ffc107" }
+                      else { "#28a745" }
+            $tBarWidth = [math]::Min([math]::Round(($t.TempC / $tempBarMaxScale) * 100, 0), 100)
+            $tempRowsHtml += @"
+            <tr>
+                <td>$([System.Net.WebUtility]::HtmlEncode($t.ZoneName))</td>
+                <td style='font-weight:700;color:$tColor;'>$($t.TempC) °C</td>
+                <td>
+                    <div style='background:#e9ecef;border-radius:6px;height:12px;width:100%;'>
+                        <div style='background:$tColor;border-radius:6px;height:12px;width:$($tBarWidth)%;'></div>
+                    </div>
+                </td>
+                <td><span style='background:$tColor;color:#fff;padding:2px 10px;border-radius:12px;font-size:0.8em;'>$($t.Status)</span></td>
+            </tr>
+"@
+        }
+    } else {
+        $tempRowsHtml = "<tr><td colspan='4' style='text-align:center;color:#6c757d;'>Temperature sensor data not available on this system.</td></tr>"
+    }
+
+    # Temperature chart data
+    $tempChartLabels = if ($Temperatures.Count -gt 0) {
+        ($Temperatures | Sort-Object TempC -Descending | ForEach-Object { "'$([System.Net.WebUtility]::HtmlEncode($_.ZoneName))'" }) -join ','
+    } else { "" }
+    $tempChartValues = if ($Temperatures.Count -gt 0) {
+        ($Temperatures | Sort-Object TempC -Descending | ForEach-Object { $_.TempC }) -join ','
+    } else { "" }
+    $tempChartColors = if ($Temperatures.Count -gt 0) {
+        ($Temperatures | Sort-Object TempC -Descending | ForEach-Object {
+            if ($_.TempC -ge 90) { "'#a71d2a'" }
+            elseif ($_.TempC -ge 80) { "'#dc3545'" }
+            elseif ($_.TempC -ge 65) { "'#ffc107'" }
+            else { "'#28a745'" }
+        }) -join ','
+    } else { "" }
 
     $html = @"
 <!DOCTYPE html>
@@ -544,6 +677,11 @@ function New-HtmlReport {
             <div class="value">$(if($Battery.Present){$Battery.ChargePercent.ToString() + '%'}else{'N/A'})</div>
             <div class="sub">$($Battery.Status)</div>
         </div>
+        <div class="card">
+            <h3>Max Temperature</h3>
+            <div class="value" style="color:$tempCardColor;">$tempCardValue</div>
+            <div class="sub">$tempCardSub</div>
+        </div>
     </div>
 
     <!-- Charts -->
@@ -559,6 +697,10 @@ function New-HtmlReport {
         <div class="chart-card">
             <h2>Performance Issues</h2>
             <canvas id="issuesChart" height="200"></canvas>
+        </div>
+        <div class="chart-card">
+            <h2>&#x1F321; Temperatures (°C)</h2>
+            <canvas id="tempChart" height="200"></canvas>
         </div>
     </div>
 
@@ -609,6 +751,16 @@ function New-HtmlReport {
         <table>
             <thead><tr><th>Severity</th><th>Issue</th><th>Details</th></tr></thead>
             <tbody>$perfRowsHtml</tbody>
+        </table>
+    </div>
+
+    <!-- Temperature -->
+    <div class="section">
+        <h2>&#x1F321; Device Temperature</h2>
+        $(if($null -ne $maxTempC -and $maxTempC -ge 80){"<p style='color:#dc3545;margin-bottom:12px;'>&#x26A0; High temperature detected. Ensure adequate ventilation and check cooling system.</p>"}elseif($null -ne $maxTempC -and $maxTempC -ge 65){"<p style='color:#ffc107;margin-bottom:12px;'>&#x26A0; Elevated temperature detected. Monitor the system closely.</p>"}else{""})
+        <table>
+            <thead><tr><th>Zone / Sensor</th><th>Temperature</th><th>Heat Bar</th><th>Status</th></tr></thead>
+            <tbody>$tempRowsHtml</tbody>
         </table>
     </div>
 </div>
@@ -672,6 +824,42 @@ function New-HtmlReport {
         },
         options: { responsive: true, plugins: { legend: { position: 'bottom' } } }
     });
+
+    const tempLabels = [$tempChartLabels];
+    const tempValues = [$tempChartValues];
+    const tempColors = [$tempChartColors];
+    const tempChartMax = $tempBarMaxScale;
+    if (tempLabels.length > 0) {
+        new Chart(document.getElementById('tempChart'), {
+            type: 'bar',
+            data: {
+                labels: tempLabels,
+                datasets: [{
+                    label: 'Temperature (°C)',
+                    data: tempValues,
+                    backgroundColor: tempColors,
+                    borderRadius: 6
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: { legend: { display: false } },
+                scales: {
+                    y: {
+                        min: 0,
+                        max: tempChartMax,
+                        ticks: { callback: v => v + '°C' }
+                    }
+                }
+            }
+        });
+    } else {
+        const tempCanvas = document.getElementById('tempChart');
+        const noDataMsg = document.createElement('p');
+        noDataMsg.style.cssText = 'color:#6c757d;text-align:center;padding:20px;';
+        noDataMsg.textContent = 'No temperature sensor data available.';
+        tempCanvas.parentNode.replaceChild(noDataMsg, tempCanvas);
+    }
 </script>
 </body>
 </html>
@@ -695,19 +883,21 @@ try {
     $gpuInfo     = Get-GPUInfo
     $batteryInfo = Get-BatteryInfo
     $startupApps = Get-StartupPrograms
-    $perfIssues  = Get-PerformanceAnalysis -CPU $cpuInfo -RAM $ramInfo -Disks $diskInfo -StartupApps $startupApps
+    $tempInfo    = Get-TemperatureInfo
+    $perfIssues  = Get-PerformanceAnalysis -CPU $cpuInfo -RAM $ramInfo -Disks $diskInfo -StartupApps $startupApps -Temperatures $tempInfo
 
     Write-Log "Generating HTML report..." "INFO"
     $htmlContent = New-HtmlReport `
-        -SystemType  $systemType `
-        -SystemInfo  $systemInfo `
-        -CPU         $cpuInfo `
-        -RAM         $ramInfo `
-        -Disks       $diskInfo `
-        -GPUs        $gpuInfo `
-        -Battery     $batteryInfo `
-        -StartupApps $startupApps `
-        -PerfIssues  $perfIssues
+        -SystemType    $systemType `
+        -SystemInfo    $systemInfo `
+        -CPU           $cpuInfo `
+        -RAM           $ramInfo `
+        -Disks         $diskInfo `
+        -GPUs          $gpuInfo `
+        -Battery       $batteryInfo `
+        -StartupApps   $startupApps `
+        -PerfIssues    $perfIssues `
+        -Temperatures  $tempInfo
 
     $htmlContent | Out-File -FilePath $ReportFile -Encoding UTF8 -Force
     Write-Log "Report saved: $ReportFile" "SUCCESS"
