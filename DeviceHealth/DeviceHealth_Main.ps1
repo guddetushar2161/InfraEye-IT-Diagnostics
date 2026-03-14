@@ -892,8 +892,8 @@ try {
     $diskInfo    = Get-DiskInfo
     $gpuInfo     = Get-GPUInfo
     $batteryInfo = Get-BatteryInfo
-    $startupApps = Get-StartupPrograms
-    $tempInfo    = Get-TemperatureInfo
+    $startupApps = @(Get-StartupPrograms)
+    $tempInfo    = @(Get-TemperatureInfo)
     $perfIssues  = Get-PerformanceAnalysis -CPU $cpuInfo -RAM $ramInfo -Disks $diskInfo -StartupApps $startupApps -Temperatures $tempInfo
 
     Write-Log "Generating HTML report..." "INFO"
@@ -915,7 +915,7 @@ try {
     # Alert check
     $alertScript = Join-Path $PSScriptRoot "DeviceHealth_Alert.ps1"
     if (Test-Path $alertScript) {
-        $criticalIssues = $perfIssues | Where-Object { $_.Severity -eq "HIGH" }
+        $criticalIssues = @($perfIssues | Where-Object { $_.Severity -eq "HIGH" })
         if ($criticalIssues.Count -gt 0 -or $cpuInfo.UsagePercent -gt 95 -or $ramInfo.UsedPercent -gt 95) {
             Write-Log "Critical issues detected. Triggering alert script..." "WARN"
             & $alertScript -ReportFile $ReportFile -CPU $cpuInfo.UsagePercent -RAM $ramInfo.UsedPercent -StartupCount $startupApps.Count

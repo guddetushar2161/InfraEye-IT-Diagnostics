@@ -530,8 +530,8 @@ function New-HtmlReport {
     $typeCounts    = ($typeBreakdown | ForEach-Object { $_.Count }) -join ","
 
     # Online vs offline
-    $onlineCount  = ($Devices | Where-Object { $_.Status -eq "Online" }).Count
-    $offlineCount = ($Devices | Where-Object { $_.Status -ne "Online" }).Count
+    $onlineCount  = @($Devices | Where-Object { $_.Status -eq "Online" }).Count
+    $offlineCount = @($Devices | Where-Object { $_.Status -ne "Online" }).Count
 
     $html = @"
 <!DOCTYPE html>
@@ -597,22 +597,22 @@ function New-HtmlReport {
         </div>
         <div class="card">
             <h3>Servers</h3>
-            <div class="value" style="color:#dc3545;">$(($Devices | Where-Object {$_.DeviceType -match 'Server'}).Count)</div>
+            <div class="value" style="color:#dc3545;">$(@($Devices | Where-Object {$_.DeviceType -match 'Server'}).Count)</div>
             <div class="sub">Detected servers</div>
         </div>
         <div class="card">
             <h3>Workstations</h3>
-            <div class="value" style="color:#0d6efd;">$(($Devices | Where-Object {$_.DeviceType -eq 'Workstation'}).Count)</div>
+            <div class="value" style="color:#0d6efd;">$(@($Devices | Where-Object {$_.DeviceType -eq 'Workstation'}).Count)</div>
             <div class="sub">Detected workstations</div>
         </div>
         <div class="card">
             <h3>Network Devices</h3>
-            <div class="value" style="color:#fd7e14;">$(($Devices | Where-Object {$_.DeviceType -match 'Router|Switch|Firewall'}).Count)</div>
+            <div class="value" style="color:#fd7e14;">$(@($Devices | Where-Object {$_.DeviceType -match 'Router|Switch|Firewall'}).Count)</div>
             <div class="sub">Routers, switches, firewalls</div>
         </div>
         <div class="card">
             <h3>Unknown Devices</h3>
-            <div class="value" style="color:#6c757d;">$(($Devices | Where-Object {$_.DeviceType -eq 'Unknown Device'}).Count)</div>
+            <div class="value" style="color:#6c757d;">$(@($Devices | Where-Object {$_.DeviceType -eq 'Unknown Device'}).Count)</div>
             <div class="sub">Unclassified devices</div>
         </div>
     </div>
@@ -810,10 +810,10 @@ try {
     }
 
     # Server roles (local)
-    $serverRoles = Get-LocalServerRoles
+    $serverRoles = @(Get-LocalServerRoles)
 
     # Duplicate IP check
-    $duplicateIPs = Find-DuplicateIPs -Devices $allDevices
+    $duplicateIPs = @(Find-DuplicateIPs -Devices $allDevices)
 
     # Export to Excel
     if ($allDevices.Count -gt 0) {
@@ -835,8 +835,8 @@ try {
     # Trigger alert if needed
     $alertScript = Join-Path $PSScriptRoot "Infrastructure_Alert.ps1"
     if (Test-Path $alertScript) {
-        $dhcpCritical  = $dhcpDataList | Where-Object { $_.Status -eq "CRITICAL" }
-        $unknownDevices= $allDevices   | Where-Object { $_.DeviceType -eq "Unknown Device" }
+        $dhcpCritical  = @($dhcpDataList | Where-Object { $_.Status -eq "CRITICAL" })
+        $unknownDevices= @($allDevices   | Where-Object { $_.DeviceType -eq "Unknown Device" })
         $dupCount      = $duplicateIPs.Count
 
         if ($dhcpCritical.Count -gt 0 -or $unknownDevices.Count -gt 0 -or $dupCount -gt 0) {

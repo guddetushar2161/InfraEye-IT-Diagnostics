@@ -439,7 +439,7 @@ function New-HtmlReport {
         </div>
         <div class="card">
             <h3>Issues Found</h3>
-            <div class="value" style="color:$(if(($NetIssues | Where-Object {$_.Severity -eq 'HIGH'}).Count -gt 0){'#dc3545'}elseif(($NetIssues | Where-Object {$_.Severity -eq 'OK'}).Count -eq $NetIssues.Count){'#28a745'}else{'#ffc107'});">$(($NetIssues | Where-Object {$_.Severity -ne 'OK'}).Count)</div>
+            <div class="value" style="color:$(if(@($NetIssues | Where-Object {$_.Severity -eq 'HIGH'}).Count -gt 0){'#dc3545'}elseif(@($NetIssues | Where-Object {$_.Severity -eq 'OK'}).Count -eq $NetIssues.Count){'#28a745'}else{'#ffc107'});">$(@($NetIssues | Where-Object {$_.Severity -ne 'OK'}).Count)</div>
             <div class="sub">Network problems detected</div>
         </div>
     </div>
@@ -574,16 +574,16 @@ try {
 
     Install-RequiredModules
 
-    $adapterInfo   = Get-NetworkAdapterInfo
+    $adapterInfo   = @(Get-NetworkAdapterInfo)
     $publicIPInfo  = Get-PublicIPInfo
-    $pingResults   = Invoke-PingTest -Targets @("8.8.8.8","1.1.1.1","8.8.4.4")
+    $pingResults   = @(Invoke-PingTest -Targets @("8.8.8.8","1.1.1.1","8.8.4.4"))
     $speedTest     = Invoke-SpeedTest
-    $netProcesses  = Get-NetworkUsage
-    $netIssues     = Get-NetworkIssueAnalysis `
+    $netProcesses  = @(Get-NetworkUsage)
+    $netIssues     = @(Get-NetworkIssueAnalysis `
                         -Adapters    $adapterInfo `
                         -PublicIP    $publicIPInfo `
                         -PingResults $pingResults `
-                        -SpeedTest   $speedTest
+                        -SpeedTest   $speedTest)
 
     Write-Log "Generating HTML report..." "INFO"
     $htmlContent = New-HtmlReport `
@@ -600,7 +600,7 @@ try {
     # Trigger alert if needed
     $alertScript = Join-Path $PSScriptRoot "NetworkDiagnostics_Alert.ps1"
     if (Test-Path $alertScript) {
-        $highIssues = $netIssues | Where-Object { $_.Severity -eq "HIGH" }
+        $highIssues = @($netIssues | Where-Object { $_.Severity -eq "HIGH" })
         if ($highIssues.Count -gt 0) {
             Write-Log "Critical network issues found. Triggering alert..." "WARN"
             $avgLat  = if ($pingResults.Count -gt 0) { ($pingResults | Measure-Object -Property AvgLatency -Average).Average } else { 0 }

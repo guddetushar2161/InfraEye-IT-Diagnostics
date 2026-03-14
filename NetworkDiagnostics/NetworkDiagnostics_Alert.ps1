@@ -169,7 +169,7 @@ try {
                     try { $ping.Send($t, 2000) } catch { $null }
                 }
                 $ping.Dispose()
-                $ok   = ($replies | Where-Object { $_ -and $_.Status -eq "Success" })
+                $ok   = @($replies | Where-Object { $_ -and $_.Status -eq "Success" })
                 $fail = 5 - $ok.Count
                 if ($ok.Count -gt 0) {
                     $latencies += ($ok | Measure-Object -Property RoundtripTime -Average).Average
