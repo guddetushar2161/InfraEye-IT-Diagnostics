@@ -1,21 +1,58 @@
 {
-    "smtp_server": "smtp.gmail.com",
-    "smtp_port": 587,
-    "from_email": "guddetushar.mitspl@gmail.com",
-    "to_email": "tech.support@mitspl.com",
-    "smtp_username": "guddetushar.mitspl@gmail.com",
-    "smtp_password": "REPLACE_WITH_APP_PASSWORD",
-    "enable_ssl": true,
+    "version": "2.1.6.1",
+    "report_version": "2.1.6.1",
+    "created_by": "Tushar Gudde",
+    "website": "https://tushargudde.tech",
+    
+    "features": {
+        "historical_comparison": true,
+        "pdf_export_button": true,
+        "dependency_map": true
+    },
+    
+    "history": {
+        "enabled": true,
+        "snapshot_directory": "history",
+        "max_snapshots": 30,
+        "auto_cleanup": true
+    },
+    
+    "pdf_export": {
+        "enabled": true,
+        "use_weasyprint": true,
+        "paper_size": "A4",
+        "margins_mm": 20
+    },
+    
+    "dependency_map": {
+        "enabled": true,
+        "use_vis_js_cdn": true,
+        "vis_js_version": "4.21.0"
+    },
+    
     "alert_thresholds": {
-        "cpu_percent": 95,
-        "ram_percent": 95,
-        "disk_free_percent": 10,
+        "cpu_percent": 85,
+        "ram_percent": 80,
+        "disk_percent": 85,
+        "temp_celsius": 80,
         "startup_apps_max": 20,
         "latency_ms": 200,
         "packet_loss_percent": 5,
         "download_speed_mbps": 10,
         "dhcp_pool_percent": 90
     },
+    
+    "email": {
+        "smtp_server": "smtp.gmail.com",
+        "smtp_port": 587,
+        "from_email": "guddetushar.mitspl@gmail.com",
+        "to_email": "tech.support@mitspl.com",
+        "smtp_username": "guddetushar.mitspl@gmail.com",
+        "smtp_password": "REPLACE_WITH_APP_PASSWORD",
+        "enable_ssl": true,
+        "enabled": true
+    },
+    
     "network_scan": {
         "ranges": [
             "192.168.1.0/24",
@@ -25,7 +62,24 @@
         "ping_timeout_ms": 500,
         "max_threads": 50
     },
-    "report_version": "2.0",
-    "created_by": "Tushar Gudde",
-    "website": "https://tushargudde.tech"
+    
+    "service_dependencies": {
+        "enabled": true,
+        "network_services": {
+            "networking": ["ssh", "http", "https", "dns", "smtp"],
+            "dns": ["web services", "email", "api calls", "database connections"],
+            "http": ["web applications", "api services"],
+            "https": ["web applications", "api services", "authentication"],
+            "database": ["web applications", "api services", "business logic"],
+            "ssh": ["remote administration", "file transfer", "monitoring"],
+            "smtp": ["email delivery", "notifications", "alerts"]
+        }
+    },
+    
+    "reporting": {
+        "output_directory": "Reports",
+        "log_directory": "Logs",
+        "filename_format": "InfraEye_Report_{hostname}_{timestamp}",
+        "include_timestamp": true
+    }
 }
