@@ -1,0 +1,3 @@
+2026-03-14 19:27:45 | DeviceHealthAlert | INFO | === Device Health Alert Check Started ===
+2026-03-14 19:27:45 | DeviceHealthAlert | INFO | No thresholds exceeded. No alert sent.
+2026-03-14 19:27:45 | DeviceHealthAlert | SUCCESS | === Device Health Alert Check Completed ===

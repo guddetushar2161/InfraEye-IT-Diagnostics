@@ -10,8 +10,13 @@
 .WEBSITE
     https://tushargudde.tech
 .VERSION
-    1.0
+    2.0
 #>
+
+param(
+    [switch]$RunCleanup,
+    [switch]$ForceCleanup
+)
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -28,6 +33,7 @@ if (!(Test-Path $LogDir))    { New-Item -ItemType Directory -Path $LogDir    | O
 $Timestamp    = Get-Date -Format "yyyyMMdd_HHmmss"
 $LogFile      = Join-Path $LogDir "DeviceHealth_$Timestamp.log"
 $ReportFile   = Join-Path $ReportDir "DeviceHealth_$Timestamp.html"
+$HistoryFile  = Join-Path $LogDir "DeviceHealth_History.jsonl"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -46,6 +52,32 @@ function Write-Log {
         "ERROR"   { Write-Host $Entry -ForegroundColor Red }
         "SUCCESS" { Write-Host $Entry -ForegroundColor Green }
     }
+}
+
+function Convert-ToDouble {
+    param(
+        $Value,
+        [double]$Default = 0
+    )
+    try {
+        if ($null -eq $Value) { return $Default }
+        if ($Value -is [string]) {
+            $clean = ($Value -replace '[^0-9\.-]', '')
+            if ([string]::IsNullOrWhiteSpace($clean)) { return $Default }
+            return [double]$clean
+        }
+        return [double]$Value
+    } catch {
+        return $Default
+    }
+}
+
+function Merge-ObjectArrays {
+    param(
+        $Primary,
+        $Secondary
+    )
+    return @($Primary) + @($Secondary)
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -167,11 +199,83 @@ function Get-RAMInfo {
     }
 }
 
+function Get-DriveTransferProfile {
+    param(
+        [string]$BusType,
+        [string]$MediaType,
+        [string]$Model
+    )
+
+    $bus = ([string]$BusType).ToUpper()
+    $media = ([string]$MediaType).ToUpper()
+    $modelText = ([string]$Model).ToUpper()
+
+    if ($bus -eq "NVME" -or $modelText -match "NVME") {
+        $gen = "NVMe"
+        $maxMBps = 3500
+        if ($modelText -match "GEN5|PCIE\s*5|PCIe\s*5") {
+            $gen = "NVMe Gen5"
+            $maxMBps = 14000
+        } elseif ($modelText -match "GEN4|PCIE\s*4|PCIe\s*4") {
+            $gen = "NVMe Gen4"
+            $maxMBps = 7000
+        } elseif ($modelText -match "GEN3|PCIE\s*3|PCIe\s*3") {
+            $gen = "NVMe Gen3"
+            $maxMBps = 3500
+        }
+        return [PSCustomObject]@{ Generation = $gen; MaxThroughput = "~$maxMBps MB/s (bus/theoretical)" }
+    }
+
+    if ($bus -eq "SATA" -or $modelText -match "SATA") {
+        return [PSCustomObject]@{ Generation = "SATA III"; MaxThroughput = "~600 MB/s (bus/theoretical)" }
+    }
+
+    if ($bus -eq "SAS") {
+        return [PSCustomObject]@{ Generation = "SAS"; MaxThroughput = "~1200 MB/s (bus/theoretical)" }
+    }
+
+    if ($bus -eq "USB") {
+        return [PSCustomObject]@{ Generation = "USB Storage"; MaxThroughput = "Variable by USB generation" }
+    }
+
+    if ($media -eq "HDD") {
+        return [PSCustomObject]@{ Generation = "HDD"; MaxThroughput = "~80-220 MB/s (typical sequential)" }
+    }
+
+    return [PSCustomObject]@{ Generation = if ($bus) { $bus } else { "Unknown" }; MaxThroughput = "Unavailable" }
+}
+
+function Get-DiskHardwareSummary {
+    param(
+        [string]$Vendor,
+        [string]$Model,
+        [string]$Generation,
+        [string]$Serial,
+        [string]$PartNumber,
+        [string]$Fru,
+        [string]$BusType,
+        [string]$TransferSpeed
+    )
+
+    $v = if ($Vendor) { $Vendor } else { "Unknown" }
+    $m = if ($Model) { $Model } else { "Unknown" }
+    $g = if ($Generation) { $Generation } else { "Unknown" }
+    $sn = if ($Serial) { $Serial } else { "N/A" }
+    $pn = if ($PartNumber) { $PartNumber } else { "N/A" }
+    $fruVal = if ($Fru) { $Fru } else { "N/A" }
+    $bus = if ($BusType) { $BusType } else { "Unknown" }
+    $speed = if ($TransferSpeed) { $TransferSpeed } else { "Unavailable" }
+
+    $typeIdentity = if ($v -eq "Unknown" -and $m -ne "Unknown") { $m } elseif ($v -eq "Unknown" -and $m -eq "Unknown") { "Unknown Device" } else { "$v $m" }
+    return "Type: $typeIdentity | Gen: $g | Bus: $bus | SN: $sn | PN: $pn | FRU: $fruVal | Data Rate: $speed"
+}
+
 function Get-DiskInfo {
     Write-Log "Collecting disk data..." "INFO"
     $disks = @()
     try {
         $physicalDiskTypeByNumber = @{}
+        $hardwareByNumber = @{}
         try {
             $physicalDisks = @(Get-PhysicalDisk -ErrorAction Stop)
             foreach ($physicalDisk in $physicalDisks) {
@@ -184,10 +288,45 @@ function Get-DiskInfo {
                     } else {
                         "Unknown"
                     }
+
+                    $transferProfile = Get-DriveTransferProfile -BusType ([string]$diskMatch.BusType) -MediaType ([string]$physicalDisk.MediaType) -Model ([string]$physicalDisk.Model)
+                    $hardwareByNumber[$diskMatch.Number] = [PSCustomObject]@{
+                        Vendor       = if ($physicalDisk.Manufacturer) { [string]$physicalDisk.Manufacturer } else { "Unknown" }
+                        Model        = if ($physicalDisk.Model) { [string]$physicalDisk.Model } else { [string]$physicalDisk.FriendlyName }
+                        Serial       = if ($physicalDisk.SerialNumber) { [string]$physicalDisk.SerialNumber } else { $null }
+                        PartNumber   = if ($physicalDisk.PartNumber) { [string]$physicalDisk.PartNumber } else { $null }
+                        Fru          = if ($physicalDisk.FruId) { [string]$physicalDisk.FruId } else { $null }
+                        BusType      = [string]$diskMatch.BusType
+                        Generation   = $transferProfile.Generation
+                        TransferRate = $transferProfile.MaxThroughput
+                    }
                 }
             }
         } catch {
             Write-Log "Modern physical disk metadata unavailable. Falling back to legacy disk detection." "WARN"
+        }
+
+        try {
+            $legacyDiskInfo = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop)
+            foreach ($legacyDisk in $legacyDiskInfo) {
+                $legacyNumber = $null
+                try { $legacyNumber = [int]$legacyDisk.Index } catch { $legacyNumber = $null }
+                if ($null -eq $legacyNumber -or $hardwareByNumber.ContainsKey($legacyNumber)) { continue }
+
+                $legacyTransfer = Get-DriveTransferProfile -BusType ([string]$legacyDisk.InterfaceType) -MediaType "" -Model ([string]$legacyDisk.Model)
+                $hardwareByNumber[$legacyNumber] = [PSCustomObject]@{
+                    Vendor       = if ($legacyDisk.Manufacturer) { [string]$legacyDisk.Manufacturer } else { "Unknown" }
+                    Model        = [string]$legacyDisk.Model
+                    Serial       = if ($legacyDisk.SerialNumber) { ([string]$legacyDisk.SerialNumber).Trim() } else { $null }
+                    PartNumber   = $null
+                    Fru          = $null
+                    BusType      = [string]$legacyDisk.InterfaceType
+                    Generation   = $legacyTransfer.Generation
+                    TransferRate = $legacyTransfer.MaxThroughput
+                }
+            }
+        } catch {
+            Write-Log "Legacy disk hardware metadata unavailable: $_" "WARN"
         }
 
         $logicalDisks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3"
@@ -245,6 +384,32 @@ function Get-DiskInfo {
                 "OK"
             }
 
+            $diskNumber = $null
+            $busTypeForDisk = ""
+            try {
+                $driveLetterForSummary = $disk.DeviceID.TrimEnd(':')
+                $partitionInfoForSummary = Get-Partition -DriveLetter $driveLetterForSummary -ErrorAction SilentlyContinue
+                if ($partitionInfoForSummary) {
+                    $diskInfoForSummary = $partitionInfoForSummary | Get-Disk -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($diskInfoForSummary) {
+                        $diskNumber = $diskInfoForSummary.Number
+                        $busTypeForDisk = [string]$diskInfoForSummary.BusType
+                    }
+                }
+            } catch { }
+
+            $hw = if ($null -ne $diskNumber -and $hardwareByNumber.ContainsKey($diskNumber)) { $hardwareByNumber[$diskNumber] } else { $null }
+            $transferProfileFallback = Get-DriveTransferProfile -BusType $busTypeForDisk -MediaType $diskType -Model ""
+            $hardwareSummary = Get-DiskHardwareSummary `
+                -Vendor $(if ($hw) { $hw.Vendor } else { "Unknown" }) `
+                -Model $(if ($hw) { $hw.Model } else { "Unknown" }) `
+                -Generation $(if ($hw) { $hw.Generation } else { $transferProfileFallback.Generation }) `
+                -Serial $(if ($hw) { $hw.Serial } else { $null }) `
+                -PartNumber $(if ($hw) { $hw.PartNumber } else { $null }) `
+                -Fru $(if ($hw) { $hw.Fru } else { $null }) `
+                -BusType $(if ($hw -and $hw.BusType) { $hw.BusType } else { $busTypeForDisk }) `
+                -TransferSpeed $(if ($hw -and $hw.TransferRate) { $hw.TransferRate } else { $transferProfileFallback.MaxThroughput })
+
             $disks += [PSCustomObject]@{
                 Drive          = $disk.DeviceID
                 TotalGB        = $totalGB
@@ -252,6 +417,7 @@ function Get-DiskInfo {
                 FreeGB         = $freeGB
                 FreePercent    = $freePct
                 DiskType       = $diskType
+                HardwareSummary = $hardwareSummary
                 Recommendation = $recommendation
             }
         }
@@ -291,6 +457,149 @@ function Get-BatteryInfo {
     Write-Log "Collecting battery data..." "INFO"
     try {
         $battery = Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue
+
+        # Battery report based health metrics (Design vs Full charge + Cycle count)
+        $batteryHealth = [PSCustomObject]@{
+            DesignCapacity_mWh     = $null
+            FullChargeCapacity_mWh = $null
+            CycleCount             = $null
+            HealthPercent          = $null
+            HealthStatus           = "Unknown"
+            Recommendation         = "Battery data unavailable on this system."
+            BatteryReportPath      = $null
+            BatteryName            = $null
+            BatteryManufacturer    = $null
+            BatterySerial          = $null
+            BatteryChemistry       = $null
+        }
+
+        try {
+            function Get-BatteryTextField {
+                param([string]$Raw, [string[]]$Patterns)
+                foreach ($pattern in $Patterns) {
+                    $m = [regex]::Match($Raw, $pattern)
+                    if ($m.Success) {
+                        $val = $m.Groups[1].Value.Trim()
+                        if (-not [string]::IsNullOrWhiteSpace($val)) { return $val }
+                    }
+                }
+                return $null
+            }
+
+            function Get-BatteryMetricFromReport {
+                param(
+                    [string]$Raw,
+                    [string[]]$Patterns
+                )
+
+                foreach ($pattern in $Patterns) {
+                    $m = [regex]::Match($Raw, $pattern)
+                    if ($m.Success) {
+                        $valueText = ($m.Groups[1].Value -replace '[^0-9]', '')
+                        if (-not [string]::IsNullOrWhiteSpace($valueText)) {
+                            return [int64]$valueText
+                        }
+                    }
+                }
+                return $null
+            }
+
+            $batteryReportPath = Join-Path $ReportDir ("BatteryReport_{0}.html" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+            $null = powercfg /batteryreport /output "$batteryReportPath" 2>$null
+            if (Test-Path $batteryReportPath) {
+                $batteryHealth.BatteryReportPath = $batteryReportPath
+                $raw = Get-Content -Path $batteryReportPath -Raw -ErrorAction SilentlyContinue
+                if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                    $normalizedRaw = ($raw -replace '&nbsp;', ' ' -replace "`r", ' ' -replace "`n", ' ')
+
+                    $batteryHealth.DesignCapacity_mWh = Get-BatteryMetricFromReport -Raw $normalizedRaw -Patterns @(
+                        '(?is)DESIGN\s*CAPACITY(?:\s*</span>)?\s*</td>\s*<td[^>]*>\s*([0-9][0-9,]*)\s*mWh',
+                        '(?is)DESIGN\s*CAPACITY[^0-9]{0,160}([0-9][0-9,]*)\s*mWh'
+                    )
+
+                    $batteryHealth.FullChargeCapacity_mWh = Get-BatteryMetricFromReport -Raw $normalizedRaw -Patterns @(
+                        '(?is)FULL\s*CHARGE\s*CAPACITY(?:\s*</span>)?\s*</td>\s*<td[^>]*>\s*([0-9][0-9,]*)\s*mWh',
+                        '(?is)FULL\s*CHARGE\s*CAPACITY[^0-9]{0,160}([0-9][0-9,]*)\s*mWh'
+                    )
+
+                    $cycleValue = Get-BatteryMetricFromReport -Raw $normalizedRaw -Patterns @(
+                        '(?is)CYCLE\s*COUNT(?:\s*</span>)?\s*</td>\s*<td[^>]*>\s*([0-9][0-9,]*)',
+                        '(?is)CYCLE\s*COUNT[^0-9]{0,120}([0-9][0-9,]*)'
+                    )
+                    if ($null -ne $cycleValue) {
+                        $batteryHealth.CycleCount = [int]$cycleValue
+                    }
+
+                    # Battery identification fields
+                    $batteryHealth.BatteryName = Get-BatteryTextField -Raw $normalizedRaw -Patterns @(
+                        '(?is)<span[^>]*class="label"[^>]*>NAME</span>\s*</td>\s*<td[^>]*>\s*([^<]+)',
+                        '(?is)>NAME<[/\w ]*>\s*</td>\s*<td[^>]*>([^<]+)'
+                    )
+                    $batteryHealth.BatteryManufacturer = Get-BatteryTextField -Raw $normalizedRaw -Patterns @(
+                        '(?is)<span[^>]*class="label"[^>]*>MANUFACTURER</span>\s*</td>\s*<td[^>]*>\s*([^<]+)',
+                        '(?is)>MANUFACTURER<[/\w ]*>\s*</td>\s*<td[^>]*>([^<]+)'
+                    )
+                    $batteryHealth.BatterySerial = Get-BatteryTextField -Raw $normalizedRaw -Patterns @(
+                        '(?is)<span[^>]*class="label"[^>]*>SERIAL\s*NUMBER</span>\s*</td>\s*<td[^>]*>\s*([^<]+)',
+                        '(?is)>SERIAL\s*NUMBER<[/\w ]*>\s*</td>\s*<td[^>]*>([^<]+)'
+                    )
+                    $batteryHealth.BatteryChemistry = Get-BatteryTextField -Raw $normalizedRaw -Patterns @(
+                        '(?is)<span[^>]*class="label"[^>]*>CHEMISTRY</span>\s*</td>\s*<td[^>]*>\s*([^<]+)',
+                        '(?is)>CHEMISTRY<[/\w ]*>\s*</td>\s*<td[^>]*>([^<]+)'
+                    )
+                }
+            }
+
+            # Fallback: WMI battery classes when report parsing is unavailable or incomplete.
+            if ($null -eq $batteryHealth.DesignCapacity_mWh -or $batteryHealth.DesignCapacity_mWh -le 0) {
+                $staticData = Get-CimInstance -Namespace root\wmi -ClassName BatteryStaticData -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($staticData) {
+                    $designedCapProp = $staticData.PSObject.Properties['DesignedCapacity']
+                    if ($designedCapProp -and $null -ne $designedCapProp.Value) {
+                        $batteryHealth.DesignCapacity_mWh = [int64](Convert-ToDouble $designedCapProp.Value 0)
+                    }
+                }
+            }
+
+            if ($null -eq $batteryHealth.FullChargeCapacity_mWh -or $batteryHealth.FullChargeCapacity_mWh -le 0) {
+                $fullChargeData = Get-CimInstance -Namespace root\wmi -ClassName BatteryFullChargedCapacity -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($fullChargeData) {
+                    $fullCapProp = $fullChargeData.PSObject.Properties['FullChargedCapacity']
+                    if ($fullCapProp -and $null -ne $fullCapProp.Value) {
+                        $batteryHealth.FullChargeCapacity_mWh = [int64](Convert-ToDouble $fullCapProp.Value 0)
+                    }
+                }
+            }
+
+            if ($null -eq $batteryHealth.CycleCount) {
+                $cycleData = Get-CimInstance -Namespace root\wmi -ClassName BatteryCycleCount -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($cycleData) {
+                    $cycleProp = $cycleData.PSObject.Properties['CycleCount']
+                    if ($cycleProp -and $null -ne $cycleProp.Value) {
+                        $batteryHealth.CycleCount = [int](Convert-ToDouble $cycleProp.Value 0)
+                    }
+                }
+            }
+
+            if ($null -ne $batteryHealth.DesignCapacity_mWh -and $batteryHealth.DesignCapacity_mWh -gt 0 -and
+                $null -ne $batteryHealth.FullChargeCapacity_mWh -and $batteryHealth.FullChargeCapacity_mWh -gt 0) {
+                $batteryHealth.HealthPercent = [math]::Round((($batteryHealth.FullChargeCapacity_mWh / $batteryHealth.DesignCapacity_mWh) * 100), 1)
+
+                if ($batteryHealth.HealthPercent -ge 80) {
+                    $batteryHealth.HealthStatus = "Healthy"
+                    $batteryHealth.Recommendation = "Battery healthy"
+                } elseif ($batteryHealth.HealthPercent -ge 60) {
+                    $batteryHealth.HealthStatus = "Moderate degradation"
+                    $batteryHealth.Recommendation = "Moderate degradation"
+                } else {
+                    $batteryHealth.HealthStatus = "Replacement recommended"
+                    $batteryHealth.Recommendation = "Battery replacement recommended"
+                }
+            }
+        } catch {
+            Write-Log "Battery health report parsing failed: $_" "WARN"
+        }
+
         if ($battery) {
             $statusMap = @{
                 1  = "Discharging"
@@ -306,25 +615,207 @@ function Get-BatteryInfo {
                 11 = "Partially Charged"
             }
             return [PSCustomObject]@{
-                Status  = $statusMap[[int]$battery.BatteryStatus]
-                ChargePercent = $battery.EstimatedChargeRemaining
-                Present = $true
+                Status                  = $statusMap[[int]$battery.BatteryStatus]
+                ChargePercent           = $battery.EstimatedChargeRemaining
+                Present                 = $true
+                DesignCapacity_mWh      = $batteryHealth.DesignCapacity_mWh
+                FullChargeCapacity_mWh  = $batteryHealth.FullChargeCapacity_mWh
+                CycleCount              = $batteryHealth.CycleCount
+                HealthPercent           = $batteryHealth.HealthPercent
+                HealthStatus            = $batteryHealth.HealthStatus
+                HealthRecommendation    = $batteryHealth.Recommendation
+                BatteryReportPath       = $batteryHealth.BatteryReportPath
+                BatteryName             = $batteryHealth.BatteryName
+                BatteryManufacturer     = $batteryHealth.BatteryManufacturer
+                BatterySerial           = $batteryHealth.BatterySerial
+                BatteryChemistry        = $batteryHealth.BatteryChemistry
             }
         } else {
             return [PSCustomObject]@{
-                Status        = "No Battery"
-                ChargePercent = "N/A"
-                Present       = $false
+                Status                  = "No Battery"
+                ChargePercent           = "N/A"
+                Present                 = $false
+                DesignCapacity_mWh      = $null
+                FullChargeCapacity_mWh  = $null
+                CycleCount              = $null
+                HealthPercent           = $null
+                HealthStatus            = "No Battery"
+                HealthRecommendation    = "Battery data unavailable on this system."
+                BatteryReportPath       = $batteryHealth.BatteryReportPath
+                BatteryName             = $null
+                BatteryManufacturer     = $null
+                BatterySerial           = $null
+                BatteryChemistry        = $null
             }
         }
     } catch {
         Write-Log "Error collecting battery info: $_" "WARN"
         return [PSCustomObject]@{
-            Status        = "Unknown"
-            ChargePercent = "N/A"
-            Present       = $false
+            Status                  = "Unknown"
+            ChargePercent           = "N/A"
+            Present                 = $false
+            DesignCapacity_mWh      = $null
+            FullChargeCapacity_mWh  = $null
+            CycleCount              = $null
+            HealthPercent           = $null
+            HealthStatus            = "Unknown"
+            HealthRecommendation    = "Battery data unavailable on this system."
+            BatteryReportPath       = $null
+            BatteryName             = $null
+            BatteryManufacturer     = $null
+            BatterySerial           = $null
+            BatteryChemistry        = $null
         }
     }
+}
+
+function Get-DirectorySizeBytes {
+    param([string]$Path)
+    try {
+        if (-not (Test-Path $Path)) { return [int64]0 }
+        $sum = Get-ChildItem -Path $Path -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { -not $_.PSIsContainer } |
+            Measure-Object -Property Length -Sum
+        return [int64](Convert-ToDouble $sum.Sum 0)
+    } catch {
+        return [int64]0
+    }
+}
+
+function Format-Bytes {
+    param([double]$Bytes)
+    if ($Bytes -lt 1KB) { return ("{0:N0} B" -f $Bytes) }
+    if ($Bytes -lt 1MB) { return ("{0:N2} KB" -f ($Bytes / 1KB)) }
+    if ($Bytes -lt 1GB) { return ("{0:N2} MB" -f ($Bytes / 1MB)) }
+    return ("{0:N2} GB" -f ($Bytes / 1GB))
+}
+
+function Invoke-SystemCleanup {
+    param([switch]$Force)
+
+    $summary = [PSCustomObject]@{
+        Requested           = $true
+        Performed           = $false
+        TotalRecoveredBytes = [int64]0
+        TotalRecoveredText  = "0 B"
+        Items               = @()
+    }
+
+    $confirmed = $Force.IsPresent
+    if (-not $confirmed -and [Environment]::UserInteractive) {
+        $response = Read-Host "Run optional cleanup now? (Y/N)"
+        $confirmed = $response -match '^(y|yes)$'
+    }
+    if (-not $confirmed) {
+        Write-Log "Cleanup skipped by user." "INFO"
+        return $summary
+    }
+
+    $targets = @(
+        [PSCustomObject]@{ Name = "%TEMP%"; Path = $env:TEMP },
+        [PSCustomObject]@{ Name = "%LOCALAPPDATA%\Temp"; Path = (Join-Path $env:LOCALAPPDATA "Temp") },
+        [PSCustomObject]@{ Name = "C:\Windows\Temp"; Path = "C:\Windows\Temp" },
+        [PSCustomObject]@{ Name = "C:\Windows\Prefetch"; Path = "C:\Windows\Prefetch" },
+        [PSCustomObject]@{ Name = "C:\Windows\SoftwareDistribution\Download"; Path = "C:\Windows\SoftwareDistribution\Download" },
+        [PSCustomObject]@{ Name = "C:\Windows\SoftwareDistribution\DeliveryOptimization"; Path = "C:\Windows\SoftwareDistribution\DeliveryOptimization" },
+        [PSCustomObject]@{ Name = "%LOCALAPPDATA%\D3DSCache"; Path = (Join-Path $env:LOCALAPPDATA "D3DSCache") },
+        [PSCustomObject]@{ Name = "C:\ProgramData\Microsoft\Windows\WER"; Path = "C:\ProgramData\Microsoft\Windows\WER" },
+        [PSCustomObject]@{ Name = "Thumbnail Cache"; Path = (Join-Path $env:LOCALAPPDATA "Microsoft\Windows\Explorer") }
+    )
+
+    foreach ($target in $targets) {
+        try {
+            $before = Get-DirectorySizeBytes -Path $target.Path
+            if (Test-Path $target.Path) {
+                if ($target.Name -eq "Thumbnail Cache") {
+                    Get-ChildItem -Path $target.Path -Filter "thumbcache*" -File -Force -ErrorAction SilentlyContinue |
+                        Remove-Item -Force -ErrorAction SilentlyContinue
+                } else {
+                    Get-ChildItem -Path $target.Path -Force -ErrorAction SilentlyContinue |
+                        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+            $after = Get-DirectorySizeBytes -Path $target.Path
+            $recovered = [math]::Max(0, ($before - $after))
+            $summary.TotalRecoveredBytes += [int64]$recovered
+            $summary.Items += [PSCustomObject]@{
+                Target         = $target.Name
+                RecoveredBytes = [int64]$recovered
+                RecoveredText  = (Format-Bytes -Bytes $recovered)
+                Status         = "Completed"
+            }
+        } catch {
+            $summary.Items += [PSCustomObject]@{
+                Target         = $target.Name
+                RecoveredBytes = 0
+                RecoveredText  = "0 B"
+                Status         = "Skipped/Error: $_"
+            }
+            Write-Log "Cleanup target failed ($($target.Name)): $_" "WARN"
+        }
+    }
+
+    try {
+        Clear-RecycleBin -Force -ErrorAction SilentlyContinue | Out-Null
+        $summary.Items += [PSCustomObject]@{
+            Target         = "Recycle Bin"
+            RecoveredBytes = 0
+            RecoveredText  = "Cleared"
+            Status         = "Completed"
+        }
+    } catch {
+        $summary.Items += [PSCustomObject]@{
+            Target         = "Recycle Bin"
+            RecoveredBytes = 0
+            RecoveredText  = "N/A"
+            Status         = "Skipped/Error: $_"
+        }
+    }
+
+    $summary.Performed = $true
+    $summary.TotalRecoveredText = Format-Bytes -Bytes $summary.TotalRecoveredBytes
+    Write-Log "Cleanup completed. Total recovered: $($summary.TotalRecoveredText)" "SUCCESS"
+    return $summary
+}
+
+function Get-PerformanceBoostSuggestions {
+    param(
+        [PSCustomObject]$CPU,
+        [PSCustomObject]$RAM,
+        [array]$Disks,
+        [array]$StartupApps,
+        [PSCustomObject]$Battery,
+        [array]$PerfIssues,
+        [PSCustomObject]$CleanupSummary
+    )
+
+    $tips = @()
+
+    if (Convert-ToDouble $CPU.UsagePercent 0 -ge 85) {
+        $tips += "High CPU usage detected. Close non-essential CPU-heavy apps and review scheduled scans/tasks."
+    }
+    if (Convert-ToDouble $RAM.UsedPercent 0 -ge 80) {
+        $tips += "Memory pressure is elevated. Keep fewer heavy apps open and consider upgrading to 16 GB+ RAM."
+    }
+    if (@($Disks | Where-Object { (Convert-ToDouble $_.FreePercent 100) -lt 15 }).Count -gt 0) {
+        $tips += "One or more drives are low on free space. Keep at least 15-20% free for smoother performance."
+    }
+    if (@($StartupApps).Count -gt 10) {
+        $tips += "Reduce startup applications to improve boot time and lower background load."
+    }
+    if ($Battery.Present -and $null -ne $Battery.HealthPercent -and (Convert-ToDouble $Battery.HealthPercent 100) -lt 60) {
+        $tips += "Battery health is poor. Replacing the battery can improve stability and sustained performance."
+    }
+    if ($CleanupSummary -and $CleanupSummary.Performed) {
+        $tips += "Cleanup recovered $($CleanupSummary.TotalRecoveredText). Run cleanup regularly to maintain responsiveness."
+    } else {
+        $tips += "Clean temporary locations periodically (%TEMP%, %LOCALAPPDATA%\\Temp, C:\\Windows\\Temp, Prefetch, SoftwareDistribution downloads, Recycle Bin)."
+    }
+    if (@($PerfIssues | Where-Object { $_.Severity -eq "HIGH" }).Count -eq 0) {
+        $tips += "No critical bottlenecks detected. Keep drivers, BIOS, and Windows updates current for consistent performance."
+    }
+
+    return @($tips | Select-Object -Unique)
 }
 
 function Get-TemperatureInfo {
@@ -456,6 +947,201 @@ function Get-TopProcesses {
 
     if ($rows.Count -eq 0) { return @() }
     return @($rows | Sort-Object -Property MemoryMB -Descending | Select-Object -First $TopN)
+}
+
+function Get-RecentHistoryEntries {
+    param(
+        [string]$Path,
+        [int]$MaxEntries = 20
+    )
+
+    if (-not (Test-Path $Path)) { return @() }
+
+    $entries = @()
+    try {
+        $lines = @(Get-Content -Path $Path -ErrorAction SilentlyContinue | Where-Object { $_ -and $_.Trim() -ne "" })
+        $selected = @($lines | Select-Object -Last $MaxEntries)
+        foreach ($line in $selected) {
+            try {
+                $entries += ($line | ConvertFrom-Json -ErrorAction Stop)
+            } catch { }
+        }
+    } catch {
+        Write-Log "Could not read history file $Path`: $_" "WARN"
+    }
+    return $entries
+}
+
+function Save-HistorySnapshot {
+    param(
+        [string]$Path,
+        [PSCustomObject]$Snapshot
+    )
+
+    try {
+        $Snapshot | ConvertTo-Json -Depth 6 -Compress | Add-Content -Path $Path
+    } catch {
+        Write-Log "Could not persist device history snapshot: $_" "WARN"
+    }
+}
+
+function Get-RestartPowerEvents {
+    param(
+        [int]$Days = 7,
+        [int]$MaxEvents = 15
+    )
+
+    $events = @()
+    try {
+        $startTime = (Get-Date).AddDays(-$Days)
+        $eventIds = @(41, 1074, 6005, 6006, 6008)
+        $rawEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $startTime; Id = $eventIds } -ErrorAction Stop |
+            Sort-Object TimeCreated -Descending |
+            Select-Object -First $MaxEvents)
+
+        foreach ($evt in $rawEvents) {
+            $eventType = switch ($evt.Id) {
+                41   { "Unexpected Power Loss / Crash" }
+                1074 { "Planned Restart / Shutdown" }
+                6005 { "Event Log Service Started (Boot)" }
+                6006 { "Event Log Service Stopped (Clean Shutdown)" }
+                6008 { "Unexpected Shutdown" }
+                default { "System Event" }
+            }
+            $events += [PSCustomObject]@{
+                Time    = $evt.TimeCreated
+                EventId = $evt.Id
+                Type    = $eventType
+                Source  = $evt.ProviderName
+                Detail  = if ($evt.Message) { ([string]$evt.Message).Split("`n")[0] } else { "No event message." }
+            }
+        }
+    } catch {
+        Write-Log "Could not query restart/power events: $_" "WARN"
+    }
+    return $events
+}
+
+function Get-DeviceHistoricalInsights {
+    param(
+        [string]$HistoryPath,
+        [PSCustomObject]$CurrentSnapshot,
+        [array]$TopProcesses = @(),
+        [int]$TrendRuns = 15
+    )
+
+    $history = @(Get-RecentHistoryEntries -Path $HistoryPath -MaxEntries $TrendRuns)
+    $trendRows = @()
+    $derivedIssues = @()
+    $appContributors = @()
+
+    if ($history.Count -gt 0) {
+        $avgCpu = [math]::Round((Convert-ToDouble ((@($history | Measure-Object -Property CPUUsagePercent -Average).Average)) 0), 1)
+        $avgRam = [math]::Round((Convert-ToDouble ((@($history | Measure-Object -Property RAMUsedPercent -Average).Average)) 0), 1)
+        $avgProc = [math]::Round((Convert-ToDouble ((@($history | Measure-Object -Property ProcessCount -Average).Average)) 0), 0)
+
+        $trendRows += [PSCustomObject]@{
+            Metric         = "CPU Usage"
+            Current        = "$($CurrentSnapshot.CPUUsagePercent)%"
+            Baseline       = "$avgCpu%"
+            Delta          = "$([math]::Round($CurrentSnapshot.CPUUsagePercent - $avgCpu, 1))%"
+            Interpretation = if ($CurrentSnapshot.CPUUsagePercent -gt ($avgCpu + 20)) { "Sudden CPU spike" } else { "Within expected variation" }
+        }
+        $trendRows += [PSCustomObject]@{
+            Metric         = "RAM Usage"
+            Current        = "$($CurrentSnapshot.RAMUsedPercent)%"
+            Baseline       = "$avgRam%"
+            Delta          = "$([math]::Round($CurrentSnapshot.RAMUsedPercent - $avgRam, 1))%"
+            Interpretation = if ($CurrentSnapshot.RAMUsedPercent -gt ($avgRam + 12)) { "Sudden memory pressure" } else { "Within expected variation" }
+        }
+        $trendRows += [PSCustomObject]@{
+            Metric         = "Process Count"
+            Current        = "$($CurrentSnapshot.ProcessCount)"
+            Baseline       = "$avgProc"
+            Delta          = "$([math]::Round($CurrentSnapshot.ProcessCount - $avgProc, 0))"
+            Interpretation = if ($CurrentSnapshot.ProcessCount -gt ($avgProc + 40)) { "Background app surge" } else { "Within expected variation" }
+        }
+
+        if ($CurrentSnapshot.RAMUsedPercent -gt ($avgRam + 12) -or $CurrentSnapshot.RAMUsedPercent -gt 90) {
+            $derivedIssues += [PSCustomObject]@{
+                Issue          = "Historical RAM Spike"
+                Severity       = "HIGH"
+                Detail         = "Current RAM ($($CurrentSnapshot.RAMUsedPercent)%) is significantly above recent baseline ($avgRam%)."
+                RootCause      = "Memory consumption increased abruptly compared to previous diagnostic runs."
+                Recommendation = "Inspect top memory consumers and disable/close persistent high-memory applications."
+            }
+        }
+
+        if ($CurrentSnapshot.ProcessCount -gt ($avgProc + 40)) {
+            $derivedIssues += [PSCustomObject]@{
+                Issue          = "Historical Process Surge"
+                Severity       = "MEDIUM"
+                Detail         = "Process count increased from baseline $avgProc to $($CurrentSnapshot.ProcessCount)."
+                RootCause      = "More background services/apps are active than in recent healthy runs."
+                Recommendation = "Review startup entries and recurring background services introduced recently."
+            }
+        }
+    } else {
+        $trendRows += [PSCustomObject]@{
+            Metric         = "History"
+            Current        = "First tracked run"
+            Baseline       = "N/A"
+            Delta          = "N/A"
+            Interpretation = "Trend analysis will improve after multiple runs."
+        }
+    }
+
+    $restartEvents = @(Get-RestartPowerEvents -Days 7 -MaxEvents 15)
+    $unexpectedEvents = @($restartEvents | Where-Object { $_.EventId -in @(41, 6008) })
+    if ($unexpectedEvents.Count -gt 0) {
+        $derivedIssues += [PSCustomObject]@{
+            Issue          = "Unexpected Power/Restart Events"
+            Severity       = "HIGH"
+            Detail         = "$($unexpectedEvents.Count) unexpected shutdown/power-loss event(s) detected in the last 7 days."
+            RootCause      = "Abrupt power loss, crash, thermal shutdown, or forced reset may be occurring."
+            Recommendation = "Check power source/adapter, battery health, thermal conditions, and Windows reliability history."
+        }
+    }
+
+    $recentProcessNames = @()
+    foreach ($entry in $history) {
+        foreach ($proc in @($entry.TopProcesses)) {
+            if ($proc.Name) { $recentProcessNames += [string]$proc.Name }
+        }
+    }
+
+    foreach ($proc in @($TopProcesses | Sort-Object MemoryMB -Descending | Select-Object -First 10)) {
+        $repeatCount = @($recentProcessNames | Where-Object { $_ -eq $proc.Name }).Count
+        if ($proc.MemoryMB -ge 400 -or $repeatCount -ge 4) {
+            $appContributors += [PSCustomObject]@{
+                ProcessName = $proc.Name
+                MemoryMB    = $proc.MemoryMB
+                CPU_s       = $proc.CPU_s
+                Recurrence  = $repeatCount
+                Reason      = if ($repeatCount -ge 4) { "Recurring heavy process across previous runs" } else { "High current memory usage" }
+            }
+        }
+    }
+
+    if ($appContributors.Count -eq 0) {
+        $appContributors = @($TopProcesses | Sort-Object MemoryMB -Descending | Select-Object -First 5 | ForEach-Object {
+            [PSCustomObject]@{
+                ProcessName = $_.Name
+                MemoryMB    = $_.MemoryMB
+                CPU_s       = $_.CPU_s
+                Recurrence  = 0
+                Reason      = "Top active process in current snapshot"
+            }
+        })
+    }
+
+    return [PSCustomObject]@{
+        TrendRows       = $trendRows
+        RestartEvents   = $restartEvents
+        AppContributors = $appContributors
+        DerivedIssues   = $derivedIssues
+        HistoryRuns     = $history.Count
+    }
 }
 
 function Get-PerformanceAnalysis {
@@ -627,7 +1313,10 @@ function New-HtmlReport {
         [array]$StartupApps,
         [array]$PerfIssues,
         [array]$Temperatures = @(),
-        [array]$TopProcesses = @()
+        [array]$TopProcesses = @(),
+        [PSCustomObject]$HistoricalInsights = $null,
+        [PSCustomObject]$CleanupSummary = $null,
+        [array]$PerformanceBoostSuggestions = @()
     )
 
     $reportDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -639,6 +1328,7 @@ function New-HtmlReport {
             <tr>
                 <td>$($d.Drive)</td>
                 <td><span style='background:$badgeColor;color:#fff;padding:2px 8px;border-radius:12px;font-size:0.8em;'>$($d.DiskType)</span></td>
+                <td style='font-size:0.82em;'>$([System.Net.WebUtility]::HtmlEncode($d.HardwareSummary))</td>
                 <td>$($d.TotalGB) GB</td>
                 <td>$($d.UsedGB) GB</td>
                 <td><span style='color:$freeColor;font-weight:bold;'>$($d.FreeGB) GB ($($d.FreePercent)%)</span></td>
@@ -706,6 +1396,115 @@ function New-HtmlReport {
     }
     if (-not $processRowsHtml) {
         $processRowsHtml = "<tr><td colspan='6' style='text-align:center;color:#6c757d;'>Process data unavailable.</td></tr>"
+    }
+
+    $trendRowsHtml = ""
+    foreach ($t in @($HistoricalInsights.TrendRows)) {
+        $trendRowsHtml += @"
+            <tr>
+                <td>$($t.Metric)</td>
+                <td>$($t.Current)</td>
+                <td>$($t.Baseline)</td>
+                <td>$($t.Delta)</td>
+                <td>$($t.Interpretation)</td>
+            </tr>
+"@
+    }
+    if (-not $trendRowsHtml) {
+        $trendRowsHtml = "<tr><td colspan='5' style='text-align:center;color:#6c757d;'>No historical trend data yet.</td></tr>"
+    }
+
+    $restartRowsHtml = ""
+    foreach ($e in @($HistoricalInsights.RestartEvents)) {
+        $eventColor = if ($e.EventId -in @(41, 6008)) { "#dc3545" } elseif ($e.EventId -eq 1074) { "#ffc107" } else { "#6c757d" }
+        $restartRowsHtml += @"
+            <tr>
+                <td>$($e.Time)</td>
+                <td>$($e.EventId)</td>
+                <td><span style='background:$eventColor;color:#fff;padding:2px 8px;border-radius:10px;font-size:0.8em;'>$($e.Type)</span></td>
+                <td>$($e.Source)</td>
+                <td>$([System.Net.WebUtility]::HtmlEncode($e.Detail))</td>
+            </tr>
+"@
+    }
+    if (-not $restartRowsHtml) {
+        $restartRowsHtml = "<tr><td colspan='5' style='text-align:center;color:#6c757d;'>No restart/power events found in selected history window.</td></tr>"
+    }
+
+    $appRowsHtml = ""
+    foreach ($a in @($HistoricalInsights.AppContributors)) {
+        $appRowsHtml += @"
+            <tr>
+                <td>$([System.Net.WebUtility]::HtmlEncode($a.ProcessName))</td>
+                <td>$($a.MemoryMB)</td>
+                <td>$($a.CPU_s)</td>
+                <td>$($a.Recurrence)</td>
+                <td>$($a.Reason)</td>
+            </tr>
+"@
+    }
+    if (-not $appRowsHtml) {
+        $appRowsHtml = "<tr><td colspan='5' style='text-align:center;color:#6c757d;'>No dominant application contributors identified.</td></tr>"
+    }
+
+    $cleanupRowsHtml = ""
+    foreach ($row in @($CleanupSummary.Items)) {
+        $cleanupRowsHtml += @"
+            <tr>
+                <td>$([System.Net.WebUtility]::HtmlEncode($row.Target))</td>
+                <td>$([System.Net.WebUtility]::HtmlEncode($row.RecoveredText))</td>
+                <td>$([System.Net.WebUtility]::HtmlEncode($row.Status))</td>
+            </tr>
+"@
+    }
+    if (-not $cleanupRowsHtml) {
+        $cleanupRowsHtml = "<tr><td colspan='3' style='text-align:center;color:#6c757d;'>Cleanup was not executed in this run.</td></tr>"
+    }
+
+    $installedBatteryHtml = if ($Battery.Present -and ($Battery.BatteryName -or $Battery.BatteryManufacturer -or $Battery.BatterySerial)) {
+        "<tr>" +
+        "<td>$(if($Battery.BatteryName){[System.Net.WebUtility]::HtmlEncode($Battery.BatteryName)}else{'N/A'})</td>" +
+        "<td>$(if($Battery.BatteryManufacturer){[System.Net.WebUtility]::HtmlEncode($Battery.BatteryManufacturer)}else{'N/A'})</td>" +
+        "<td>$(if($Battery.BatterySerial){[System.Net.WebUtility]::HtmlEncode($Battery.BatterySerial)}else{'N/A'})</td>" +
+        "<td>$(if($Battery.BatteryChemistry){[System.Net.WebUtility]::HtmlEncode($Battery.BatteryChemistry)}else{'N/A'})</td>" +
+        "<td>N/A</td>" +
+        "</tr>"
+    } else {
+        $noDataMsg = if ($Battery.Present) { "Battery identification data unavailable &mdash; re-run with Administrator privileges." } else { "No battery installed on this system." }
+        "<tr><td colspan='5' style='text-align:center;color:#6c757d;'>$noDataMsg</td></tr>"
+    }
+
+    $cleanupSuggestions = @(
+        [PSCustomObject]@{ Target = "%TEMP%"; Action = "Delete temporary app/installer files"; Benefit = "Frees disk space and reduces file-system clutter" },
+        [PSCustomObject]@{ Target = "%LOCALAPPDATA%\\Temp"; Action = "Remove stale user temp data"; Benefit = "Improves responsiveness for daily workloads" },
+        [PSCustomObject]@{ Target = "C:\\Windows\\Temp"; Action = "Clear system temporary files"; Benefit = "Reclaims space consumed by update/install leftovers" },
+        [PSCustomObject]@{ Target = "C:\\Windows\\Prefetch"; Action = "Trim stale prefetch cache"; Benefit = "Helps reduce boot/runtime overhead from outdated entries" },
+        [PSCustomObject]@{ Target = "C:\\Windows\\SoftwareDistribution\\Download"; Action = "Clean old Windows update downloads"; Benefit = "Recovers significant storage on long-running systems" },
+        [PSCustomObject]@{ Target = "Recycle Bin"; Action = "Empty deleted files"; Benefit = "Immediately frees recoverable disk space" }
+    )
+    $cleanupSuggestionRowsHtml = ""
+    foreach ($s in $cleanupSuggestions) {
+        $cleanupSuggestionRowsHtml += @"
+            <tr>
+                <td>$([System.Net.WebUtility]::HtmlEncode($s.Target))</td>
+                <td>$([System.Net.WebUtility]::HtmlEncode($s.Action))</td>
+                <td>$([System.Net.WebUtility]::HtmlEncode($s.Benefit))</td>
+            </tr>
+"@
+    }
+
+    $cleanupStatusText = if ($CleanupSummary -and $CleanupSummary.Performed) {
+        "Cleanup executed. Total recovered: $($CleanupSummary.TotalRecoveredText)"
+    } else {
+        "Automatic cleanup was not executed. Use these suggestions to safely free disk space and improve responsiveness."
+    }
+
+    $suggestionRowsHtml = ""
+    foreach ($tip in @($PerformanceBoostSuggestions)) {
+        $suggestionRowsHtml += "<li>$([System.Net.WebUtility]::HtmlEncode($tip))</li>"
+    }
+    if (-not $suggestionRowsHtml) {
+        $suggestionRowsHtml = "<li>No additional optimization suggestions at this time.</li>"
     }
 
     $cpuColor  = if ($CPU.UsagePercent -gt 90) { "#dc3545" } elseif ($CPU.UsagePercent -gt 70) { "#ffc107" } else { "#28a745" }
@@ -870,7 +1669,7 @@ function New-HtmlReport {
         <div class="card">
             <h3>Battery</h3>
             <div class="value">$(if($Battery.Present){$Battery.ChargePercent.ToString() + '%'}else{'N/A'})</div>
-            <div class="sub">$($Battery.Status)</div>
+            <div class="sub">$($Battery.Status)$(if($null -ne $Battery.HealthPercent){" | Health: $($Battery.HealthPercent)% ($($Battery.HealthStatus))"}else{""})</div>
         </div>
         <div class="card">
             <h3>Max Temperature</h3>
@@ -916,7 +1715,7 @@ function New-HtmlReport {
     <div class="section">
         <h2>&#x1F4BE; Disk Storage</h2>
         <table>
-            <thead><tr><th>Drive</th><th>Type</th><th>Total</th><th>Used</th><th>Free</th><th>Recommendation</th></tr></thead>
+            <thead><tr><th>Drive</th><th>Type</th><th>Hardware Summary</th><th>Total</th><th>Used</th><th>Free</th><th>Recommendation</th></tr></thead>
             <tbody>$diskRowsHtml</tbody>
         </table>
     </div>
@@ -959,6 +1758,32 @@ function New-HtmlReport {
         </table>
     </div>
 
+    <!-- Historical Trend & Incident Correlation -->
+    <div class="section">
+        <h2>&#x1F4CA; Historical Performance Trend (Previous Runs)</h2>
+        <p style="margin-bottom:12px;color:#6c757d;">Trend window analyzed: $($HistoricalInsights.HistoryRuns) previous run(s).</p>
+        <table>
+            <thead><tr><th>Metric</th><th>Current</th><th>Baseline</th><th>Delta</th><th>Interpretation</th></tr></thead>
+            <tbody>$trendRowsHtml</tbody>
+        </table>
+    </div>
+
+    <div class="section">
+        <h2>&#x1F50C; Restart &amp; Power Event Correlation (Last 7 Days)</h2>
+        <table>
+            <thead><tr><th>Time</th><th>Event ID</th><th>Type</th><th>Source</th><th>Detail</th></tr></thead>
+            <tbody>$restartRowsHtml</tbody>
+        </table>
+    </div>
+
+    <div class="section">
+        <h2>&#x1F4BB; Likely Application Slowdown Contributors</h2>
+        <table>
+            <thead><tr><th>Process</th><th>RAM (MB)</th><th>CPU Time (s)</th><th>Seen In History</th><th>Why Flagged</th></tr></thead>
+            <tbody>$appRowsHtml</tbody>
+        </table>
+    </div>
+
     <!-- Temperature -->
     <div class="section">
         <h2>&#x1F321; Device Temperature</h2>
@@ -968,9 +1793,60 @@ function New-HtmlReport {
             <tbody>$tempRowsHtml</tbody>
         </table>
     </div>
+
+    <div class="section">
+        <h2>&#x1F50B; Battery Health Analysis</h2>
+        <h3 style='font-size:0.95em;margin:14px 0 10px;padding-bottom:6px;border-bottom:1px solid #dee2e6;'>&#x1F4B4; Installed Batteries</h3>
+        <p style='font-size:0.85em;color:#6c757d;margin-bottom:10px;'>Physical battery identification data read from Windows battery report</p>
+        <table>
+            <thead><tr><th>Battery Name</th><th>Manufacturer</th><th>Serial Number</th><th>Chemistry</th><th>Battery Age</th></tr></thead>
+            <tbody>$installedBatteryHtml</tbody>
+        </table>
+        <h3 style='font-size:0.95em;margin:20px 0 10px;padding-bottom:6px;border-bottom:1px solid #dee2e6;'>&#x2764;&#xFE0F; Battery Health Metrics</h3>
+        <table>
+            <thead><tr><th>Metric</th><th>Value</th><th>Recommendation</th></tr></thead>
+            <tbody>
+                <tr><td>Design Capacity</td><td>$(if($null -ne $Battery.DesignCapacity_mWh -and $Battery.DesignCapacity_mWh -gt 0){"$($Battery.DesignCapacity_mWh) mWh"}else{"N/A"})</td><td rowspan="4">$($Battery.HealthRecommendation)</td></tr>
+                <tr><td>Full Charge Capacity</td><td>$(if($null -ne $Battery.FullChargeCapacity_mWh -and $Battery.FullChargeCapacity_mWh -gt 0){"$($Battery.FullChargeCapacity_mWh) mWh"}else{"N/A"})</td></tr>
+                <tr><td>Cycle Count</td><td>$(if($null -ne $Battery.CycleCount){$Battery.CycleCount}else{"N/A"})</td></tr>
+                <tr><td>Battery Health</td><td>$(if($null -ne $Battery.HealthPercent){"$($Battery.HealthPercent)% ($($Battery.HealthStatus))"}else{"N/A"})</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section">
+        <h2>&#x1F9F9; System Cleanup Suggestions</h2>
+        <p style='margin-bottom:12px;color:#6c757d;'>Status: $cleanupStatusText</p>
+        <table>
+            <thead><tr><th>Location</th><th>Suggested Action</th><th>Expected Benefit</th></tr></thead>
+            <tbody>$cleanupSuggestionRowsHtml</tbody>
+        </table>
+        $(if($CleanupSummary -and $CleanupSummary.Performed){"<h3 style='margin-top:16px;margin-bottom:10px;font-size:0.95em;'>Cleanup Results (This Run)</h3>"}else{""})
+        $(if($CleanupSummary -and $CleanupSummary.Performed){"<table><thead><tr><th>Target</th><th>Recovered</th><th>Status</th></tr></thead><tbody>$cleanupRowsHtml</tbody></table>"}else{""})
+    </div>
+
+    <div class="section">
+        <h2>&#x1F4CC; Battery Data Note</h2>
+        <p style='color:#6c757d;'>$(if($null -eq $Battery.HealthPercent -and $null -eq $Battery.DesignCapacity_mWh -and $null -eq $Battery.FullChargeCapacity_mWh){"Battery data unavailable on this system."}else{"Battery health percentage is calculated as (Full Charge Capacity / Design Capacity) * 100."})</p>
+        <table>
+            <thead><tr><th>Formula</th><th>Current Value</th><th>Status Band</th></tr></thead>
+            <tbody>
+                <tr>
+                    <td>(Full Charge Capacity / Design Capacity) * 100</td>
+                    <td>$(if($null -ne $Battery.HealthPercent){"$($Battery.HealthPercent)%"}else{"N/A"})</td>
+                    <td>$(if($null -eq $Battery.HealthPercent){"Unavailable"}elseif($Battery.HealthPercent -ge 80){">=80: Battery healthy"}elseif($Battery.HealthPercent -ge 60){"60-79: Moderate degradation"}else{"<60: Battery replacement recommended"})</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section">
+        <h2>&#x1F680; Performance Boost Suggestions</h2>
+        <ul style='padding-left:20px;line-height:1.7;'>$suggestionRowsHtml</ul>
+    </div>
 </div>
 <footer>
-    <p>Report Version: 1.0 &nbsp;|&nbsp; Created by: <strong>Tushar Gudde</strong> &nbsp;|&nbsp;
+    <p>Report Version: 2.0 &nbsp;|&nbsp; Created by: <strong>Tushar Gudde</strong> &nbsp;|&nbsp;
     Website: <a href="https://tushargudde.tech" target="_blank">https://tushargudde.tech</a></p>
 </footer>
 <script>
@@ -1092,6 +1968,41 @@ try {
     $tempInfo    = @(Get-TemperatureInfo)
     $perfIssues  = Get-PerformanceAnalysis -CPU $cpuInfo -RAM $ramInfo -Disks $diskInfo -StartupApps $startupApps -Temperatures $tempInfo -TopProcesses $topProcesses
 
+    $cleanupSummary = [PSCustomObject]@{
+        Requested           = $false
+        Performed           = $false
+        TotalRecoveredBytes = 0
+        TotalRecoveredText  = "0 B"
+        Items               = @()
+    }
+    if ($RunCleanup) {
+        $cleanupSummary = Invoke-SystemCleanup -Force:$ForceCleanup
+    }
+
+    $currentSnapshot = [PSCustomObject]@{
+        Timestamp       = (Get-Date).ToString("o")
+        CPUUsagePercent = $cpuInfo.UsagePercent
+        RAMUsedPercent  = $ramInfo.UsedPercent
+        ProcessCount    = (Get-Process).Count
+        StartupCount    = $startupApps.Count
+        MaxTempC        = if ($tempInfo.Count -gt 0) { ($tempInfo | Measure-Object -Property TempC -Maximum).Maximum } else { $null }
+        TopProcesses    = @($topProcesses | Select-Object -First 8 -Property Name, MemoryMB, CPU_s)
+    }
+
+    $historicalInsights = Get-DeviceHistoricalInsights -HistoryPath $HistoryFile -CurrentSnapshot $currentSnapshot -TopProcesses $topProcesses
+    if (@($historicalInsights.DerivedIssues).Count -gt 0) {
+        $perfIssues = Merge-ObjectArrays -Primary $perfIssues -Secondary $historicalInsights.DerivedIssues
+    }
+
+    $perfBoostSuggestions = Get-PerformanceBoostSuggestions `
+        -CPU $cpuInfo `
+        -RAM $ramInfo `
+        -Disks $diskInfo `
+        -StartupApps $startupApps `
+        -Battery $batteryInfo `
+        -PerfIssues $perfIssues `
+        -CleanupSummary $cleanupSummary
+
     Write-Log "Generating HTML report..." "INFO"
     $htmlContent = New-HtmlReport `
         -SystemType    $systemType `
@@ -1104,10 +2015,15 @@ try {
         -StartupApps   $startupApps `
         -PerfIssues    $perfIssues `
         -Temperatures  $tempInfo `
-        -TopProcesses  $topProcesses
+        -TopProcesses  $topProcesses `
+        -HistoricalInsights $historicalInsights `
+        -CleanupSummary $cleanupSummary `
+        -PerformanceBoostSuggestions $perfBoostSuggestions
 
     $htmlContent | Out-File -FilePath $ReportFile -Encoding UTF8 -Force
     Write-Log "Report saved: $ReportFile" "SUCCESS"
+
+    Save-HistorySnapshot -Path $HistoryFile -Snapshot $currentSnapshot
 
     # Alert check
     $alertScript = Join-Path $PSScriptRoot "DeviceHealth_Alert.ps1"

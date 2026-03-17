@@ -10,7 +10,7 @@
 .WEBSITE
     https://tushargudde.tech
 .VERSION
-    1.0
+    2.0
 #>
 
 param(
@@ -139,7 +139,7 @@ function New-AlertBody {
         <p style='margin-top:15px;font-size:0.9em;color:#6c757d;'>Please review the attached HTML report for detailed diagnostics.</p>
     </div>
     <div style='background:#f8f9fa;padding:15px 30px;text-align:center;font-size:0.8em;color:#6c757d;'>
-        Report Version: 1.0 | Created by: Tushar Gudde | <a href='https://tushargudde.tech'>https://tushargudde.tech</a>
+        Report Version: 2.0 | Created by: Tushar Gudde | <a href='https://tushargudde.tech'>https://tushargudde.tech</a>
     </div>
 </div>
 </body></html>

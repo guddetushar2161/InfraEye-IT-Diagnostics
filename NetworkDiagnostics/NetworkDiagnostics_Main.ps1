@@ -10,7 +10,7 @@
 .WEBSITE
     https://tushargudde.tech
 .VERSION
-    1.0
+    2.0
 #>
 
 $ErrorActionPreference = "Stop"
@@ -28,6 +28,7 @@ if (!(Test-Path $LogDir))    { New-Item -ItemType Directory -Path $LogDir    | O
 $Timestamp  = Get-Date -Format "yyyyMMdd_HHmmss"
 $LogFile    = Join-Path $LogDir "NetworkDiagnostics_$Timestamp.log"
 $ReportFile = Join-Path $ReportDir "NetworkDiagnostics_$Timestamp.html"
+$HistoryFile = Join-Path $LogDir "NetworkDiagnostics_History.jsonl"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -46,6 +47,40 @@ function Write-Log {
         "ERROR"   { Write-Host $Entry -ForegroundColor Red }
         "SUCCESS" { Write-Host $Entry -ForegroundColor Green }
     }
+}
+
+function Convert-ToDouble {
+    param(
+        $Value,
+        [double]$Default = 0
+    )
+    try {
+        if ($null -eq $Value) { return $Default }
+        if ($Value -is [string]) {
+            $clean = ($Value -replace '[^0-9\.-]', '')
+            if ([string]::IsNullOrWhiteSpace($clean)) { return $Default }
+            return [double]$clean
+        }
+        return [double]$Value
+    } catch {
+        return $Default
+    }
+}
+
+function Merge-ObjectArrays {
+    param(
+        $Primary,
+        $Secondary
+    )
+    return @($Primary) + @($Secondary)
+}
+
+function Get-NetworkDownloadStatus {
+    param([double]$DownloadMbps)
+    if ($DownloadMbps -gt 50) { return "Excellent" }
+    if ($DownloadMbps -ge 20) { return "Good" }
+    if ($DownloadMbps -ge 10) { return "Moderate" }
+    return "Poor"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,35 +230,153 @@ function Invoke-PingTest {
 }
 
 function Invoke-SpeedTest {
-    Write-Log "Estimating download speed..." "INFO"
-    try {
-        $url        = "http://speedtest.tele2.net/10MB.zip"
-        $startTime  = Get-Date
-        $wc         = New-Object System.Net.WebClient
-        $tempFile   = [System.IO.Path]::GetTempFileName()
+    Write-Log "Running internet speed test..." "INFO"
+
+    # Inner helper: run Ookla CLI at given path, return result object or $null
+    function Invoke-SpeedtestCLI ([string]$ExePath) {
         try {
-            $wc.DownloadFile($url, $tempFile)
-            $elapsed    = ((Get-Date) - $startTime).TotalSeconds
-            $fileSize   = (Get-Item $tempFile).Length
-            $speedMbps  = [math]::Round(($fileSize * 8) / ($elapsed * 1MB), 2)
-            Write-Log "Estimated download speed: $speedMbps Mbps" "INFO"
-            return [PSCustomObject]@{
-                DownloadMbps = $speedMbps
-                TestFile     = "10 MB from speedtest.tele2.net"
-                Duration_s   = [math]::Round($elapsed, 2)
-                Status       = "Completed"
+            $jsonRaw = & $ExePath --accept-license --accept-gdpr --format=json 2>$null
+            if ($LASTEXITCODE -eq 0 -and $jsonRaw) {
+                $obj          = $jsonRaw | ConvertFrom-Json -ErrorAction Stop
+                $downloadMbps = [math]::Round((Convert-ToDouble $obj.download.bandwidth 0) * 8 / 1MB, 2)
+                $uploadMbps   = [math]::Round((Convert-ToDouble $obj.upload.bandwidth 0) * 8 / 1MB, 2)
+                $pingMs       = [math]::Round((Convert-ToDouble $obj.ping.latency 0), 2)
+                Write-Log "Speedtest CLI result: Download=$downloadMbps Mbps, Upload=$uploadMbps Mbps, Ping=$pingMs ms" "INFO"
+                return [PSCustomObject]@{
+                    DownloadMbps = $downloadMbps
+                    UploadMbps   = $uploadMbps
+                    PingMs       = $pingMs
+                    Status       = "Completed"
+                    Quality      = Get-NetworkDownloadStatus -DownloadMbps $downloadMbps
+                    Method       = "Ookla Speedtest CLI"
+                }
             }
-        } finally {
-            $wc.Dispose()
-            if (Test-Path $tempFile) { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue }
+        } catch { }
+        return $null
+    }
+
+    # Primary: Ookla Speedtest CLI (most accurate; matches Ookla web result)
+    $speedtestCmd = Get-Command speedtest -ErrorAction SilentlyContinue
+    if ($speedtestCmd) {
+        $result = Invoke-SpeedtestCLI -ExePath $speedtestCmd.Source
+        if ($result) { return $result }
+        Write-Log "Speedtest CLI returned no valid data; using fallback." "WARN"
+    } else {
+        # Auto-install via winget when CLI is absent
+        try {
+            $winget = Get-Command winget -ErrorAction SilentlyContinue
+            if ($winget) {
+                Write-Log "Speedtest CLI not found. Installing via winget (silent)..." "INFO"
+                $proc = Start-Process -FilePath $winget.Source `
+                    -ArgumentList "install --id Ookla.Speedtest.CLI --accept-package-agreements --accept-source-agreements --silent" `
+                    -Wait -PassThru -NoNewWindow 2>$null
+                if ($proc.ExitCode -eq 0) {
+                    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
+                                [System.Environment]::GetEnvironmentVariable("Path","User")
+                    $newCmd = Get-Command speedtest -ErrorAction SilentlyContinue
+                    if ($newCmd) {
+                        Write-Log "Speedtest CLI installed successfully. Running test..." "SUCCESS"
+                        $result = Invoke-SpeedtestCLI -ExePath $newCmd.Source
+                        if ($result) { return $result }
+                    }
+                }
+            }
+        } catch {
+            Write-Log "Winget install of Speedtest CLI failed: $_" "WARN"
+        }
+    }
+
+    # Fallback: 4-stream parallel download from Cloudflare + upload POST + ICMP ping
+    Write-Log "Running multi-stream Cloudflare fallback speed test..." "INFO"
+    try {
+        $downloadBytes = [int64](25 * 1024 * 1024)   # 25 MB per stream
+        $streamCount   = 4
+        $cfDownUrl     = "https://speed.cloudflare.com/__down?bytes=$downloadBytes"
+
+        $dlScript = {
+            param([string]$Url, [int64]$Bytes)
+            try {
+                $wc  = New-Object System.Net.WebClient
+                $tmp = [System.IO.Path]::GetTempFileName()
+                $sw  = [System.Diagnostics.Stopwatch]::StartNew()
+                $wc.DownloadFile($Url, $tmp)
+                $sw.Stop(); $wc.Dispose()
+                if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+                return [PSCustomObject]@{ OK = $true; Elapsed = $sw.Elapsed.TotalSeconds; Bytes = $Bytes }
+            } catch {
+                return [PSCustomObject]@{ OK = $false; Elapsed = 0; Bytes = 0 }
+            }
+        }
+
+        $pool = [RunspaceFactory]::CreateRunspacePool(1, $streamCount)
+        $pool.Open()
+        $globalStart = Get-Date
+        $jobs = @()
+        for ($i = 0; $i -lt $streamCount; $i++) {
+            $ps = [PowerShell]::Create()
+            $ps.RunspacePool = $pool
+            [void]$ps.AddScript($dlScript).AddArgument($cfDownUrl).AddArgument($downloadBytes)
+            $jobs += [PSCustomObject]@{ PS = $ps; Handle = $ps.BeginInvoke() }
+        }
+        $dlResults = @()
+        foreach ($j in $jobs) {
+            $r = $j.PS.EndInvoke($j.Handle)
+            if ($r -and $r.OK) { $dlResults += $r }
+            $j.PS.Dispose()
+        }
+        $pool.Close(); $pool.Dispose()
+
+        $totalElapsed = ((Get-Date) - $globalStart).TotalSeconds
+        $totalBytes   = [int64]($dlResults.Count * $downloadBytes)
+        $downloadMbps = if ($totalElapsed -gt 0 -and $dlResults.Count -gt 0) {
+            [math]::Round(($totalBytes * 8) / ($totalElapsed * 1MB), 2)
+        } else { 0 }
+
+        # Upload: POST 5 MB to Cloudflare speed test endpoint
+        $uploadMbps = 0
+        try {
+            $payload = New-Object byte[] (5 * 1024 * 1024)
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers.Add("Content-Type", "application/octet-stream")
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $null = $wc.UploadData("https://speed.cloudflare.com/__up", "POST", $payload)
+            $sw.Stop(); $wc.Dispose()
+            if ($sw.Elapsed.TotalSeconds -gt 0) {
+                $uploadMbps = [math]::Round(($payload.Length * 8) / ($sw.Elapsed.TotalSeconds * 1MB), 2)
+            }
+        } catch {
+            Write-Log "Upload speed test failed: $_" "WARN"
+        }
+
+        # Ping: 5 ICMP samples to 8.8.8.8
+        $latencies = @(1..5 | ForEach-Object {
+            $p = New-Object System.Net.NetworkInformation.Ping
+            $r = $p.Send("8.8.8.8", 3000); $p.Dispose()
+            if ($r.Status -eq "Success") { $r.RoundtripTime }
+        })
+        $pingMs = if ($latencies.Count -gt 0) {
+            [math]::Round(($latencies | Measure-Object -Average).Average, 2)
+        } else { 0 }
+
+        $status = Get-NetworkDownloadStatus -DownloadMbps $downloadMbps
+        Write-Log "Fallback result: Download=$downloadMbps Mbps, Upload=$uploadMbps Mbps, Ping=$pingMs ms" "INFO"
+        return [PSCustomObject]@{
+            DownloadMbps = $downloadMbps
+            UploadMbps   = $uploadMbps
+            PingMs       = $pingMs
+            Status       = "Completed"
+            Quality      = $status
+            Method       = "Multi-stream Cloudflare fallback"
         }
     } catch {
-        Write-Log "Speed test failed (network/timeout): $_" "WARN"
+        Write-Log "Speed test failed: $_" "WARN"
         return [PSCustomObject]@{
             DownloadMbps = 0
-            TestFile     = "N/A"
-            Duration_s   = 0
+            UploadMbps   = 0
+            PingMs       = 0
             Status       = "Failed"
+            Quality      = "Poor"
+            Method       = "Unavailable"
         }
     }
 }
@@ -254,6 +407,147 @@ function Get-NetworkUsage {
         Write-Log "Could not collect network usage data: $_" "WARN"
     }
     return $netProcesses
+}
+
+function Get-RecentHistoryEntries {
+    param(
+        [string]$Path,
+        [int]$MaxEntries = 20
+    )
+
+    if (-not (Test-Path $Path)) { return @() }
+
+    $entries = @()
+    try {
+        $lines = @(Get-Content -Path $Path -ErrorAction SilentlyContinue | Where-Object { $_ -and $_.Trim() -ne "" })
+        $selected = @($lines | Select-Object -Last $MaxEntries)
+        foreach ($line in $selected) {
+            try {
+                $entries += ($line | ConvertFrom-Json -ErrorAction Stop)
+            } catch { }
+        }
+    } catch {
+        Write-Log "Could not read network history file $Path`: $_" "WARN"
+    }
+    return $entries
+}
+
+function Save-HistorySnapshot {
+    param(
+        [string]$Path,
+        [PSCustomObject]$Snapshot
+    )
+    try {
+        $Snapshot | ConvertTo-Json -Depth 6 -Compress | Add-Content -Path $Path
+    } catch {
+        Write-Log "Could not persist network history snapshot: $_" "WARN"
+    }
+}
+
+function Get-NetworkHistoricalInsights {
+    param(
+        [string]$HistoryPath,
+        [PSCustomObject]$CurrentSnapshot,
+        [array]$NetProcesses = @(),
+        [int]$TrendRuns = 15
+    )
+
+    $history = @(Get-RecentHistoryEntries -Path $HistoryPath -MaxEntries $TrendRuns)
+    $trendRows = @()
+    $derivedIssues = @()
+    $appContributors = @()
+
+    if ($history.Count -gt 0) {
+        $avgLatency = [math]::Round((@($history | Measure-Object -Property AvgLatency -Average).Average), 1)
+        $avgLoss = [math]::Round((@($history | Measure-Object -Property MaxPacketLoss -Average).Average), 1)
+        $avgSpeed = [math]::Round((@($history | Where-Object { $_.DownloadMbps -gt 0 } | Measure-Object -Property DownloadMbps -Average).Average), 2)
+
+        $trendRows += [PSCustomObject]@{
+            Metric         = "Average Latency"
+            Current        = "$($CurrentSnapshot.AvgLatency) ms"
+            Baseline       = "$avgLatency ms"
+            Delta          = "$([math]::Round($CurrentSnapshot.AvgLatency - $avgLatency, 1)) ms"
+            Interpretation = if ($CurrentSnapshot.AvgLatency -gt ($avgLatency + 40)) { "Sudden latency spike" } else { "Within expected variation" }
+        }
+        $trendRows += [PSCustomObject]@{
+            Metric         = "Max Packet Loss"
+            Current        = "$($CurrentSnapshot.MaxPacketLoss)%"
+            Baseline       = "$avgLoss%"
+            Delta          = "$([math]::Round($CurrentSnapshot.MaxPacketLoss - $avgLoss, 1))%"
+            Interpretation = if ($CurrentSnapshot.MaxPacketLoss -gt ($avgLoss + 5)) { "Sudden packet-loss spike" } else { "Within expected variation" }
+        }
+        $trendRows += [PSCustomObject]@{
+            Metric         = "Download Speed"
+            Current        = "$($CurrentSnapshot.DownloadMbps) Mbps"
+            Baseline       = if ($avgSpeed -gt 0) { "$avgSpeed Mbps" } else { "N/A" }
+            Delta          = if ($avgSpeed -gt 0) { "$([math]::Round($CurrentSnapshot.DownloadMbps - $avgSpeed, 2)) Mbps" } else { "N/A" }
+            Interpretation = if ($avgSpeed -gt 0 -and $CurrentSnapshot.DownloadMbps -lt ($avgSpeed * 0.6)) { "Sudden throughput drop" } else { "Within expected variation" }
+        }
+
+        if ($CurrentSnapshot.AvgLatency -gt ($avgLatency + 40) -or $CurrentSnapshot.MaxPacketLoss -gt ($avgLoss + 5)) {
+            $derivedIssues += [PSCustomObject]@{
+                Severity = "HIGH"
+                Issue    = "Historical Network Degradation"
+                Detail   = "Current latency/loss is significantly worse than recent baseline; likely sudden degradation event."
+            }
+        }
+        if ($avgSpeed -gt 0 -and $CurrentSnapshot.DownloadMbps -lt ($avgSpeed * 0.6)) {
+            $derivedIssues += [PSCustomObject]@{
+                Severity = "MEDIUM"
+                Issue    = "Historical Throughput Drop"
+                Detail   = "Current download speed dropped sharply compared to recent historical runs."
+            }
+        }
+    } else {
+        $trendRows += [PSCustomObject]@{
+            Metric         = "History"
+            Current        = "First tracked run"
+            Baseline       = "N/A"
+            Delta          = "N/A"
+            Interpretation = "Trend analysis will improve after multiple runs."
+        }
+    }
+
+    $recentProcNames = @()
+    foreach ($entry in $history) {
+        foreach ($p in @($entry.TopNetProcesses)) {
+            if ($p.ProcessName) { $recentProcNames += [string]$p.ProcessName }
+        }
+    }
+
+    foreach ($p in @($NetProcesses | Sort-Object Connections -Descending | Select-Object -First 10)) {
+        $repeatCount = @($recentProcNames | Where-Object { $_ -eq $p.ProcessName }).Count
+        if ($p.Connections -ge 8 -or $repeatCount -ge 4) {
+            $appContributors += [PSCustomObject]@{
+                ProcessName = $p.ProcessName
+                PID         = $p.PID
+                Connections = $p.Connections
+                MemoryMB    = $p.Memory_MB
+                Recurrence  = $repeatCount
+                Reason      = if ($repeatCount -ge 4) { "Recurring high network activity across runs" } else { "High active TCP connections currently" }
+            }
+        }
+    }
+
+    if ($appContributors.Count -eq 0) {
+        $appContributors = @($NetProcesses | Sort-Object Connections -Descending | Select-Object -First 5 | ForEach-Object {
+            [PSCustomObject]@{
+                ProcessName = $_.ProcessName
+                PID         = $_.PID
+                Connections = $_.Connections
+                MemoryMB    = $_.Memory_MB
+                Recurrence  = 0
+                Reason      = "Top active network process in current snapshot"
+            }
+        })
+    }
+
+    return [PSCustomObject]@{
+        TrendRows       = $trendRows
+        AppContributors = $appContributors
+        DerivedIssues   = $derivedIssues
+        HistoryRuns     = $history.Count
+    }
 }
 
 function Get-NetworkIssueAnalysis {
@@ -287,7 +581,13 @@ function Get-NetworkIssueAnalysis {
 
     # Check speed
     if ($SpeedTest.Status -eq "Completed" -and $SpeedTest.DownloadMbps -lt 10) {
-        $issues += [PSCustomObject]@{ Severity = "MEDIUM"; Issue = "ISP Slow Speed"; Detail = "Download speed $($SpeedTest.DownloadMbps) Mbps is below 10 Mbps threshold." }
+        $issues += [PSCustomObject]@{ Severity = "HIGH"; Issue = "ISP Slow Speed"; Detail = "Download speed $($SpeedTest.DownloadMbps) Mbps is below 10 Mbps threshold." }
+    } elseif ($SpeedTest.Status -eq "Completed" -and $SpeedTest.DownloadMbps -lt 20) {
+        $issues += [PSCustomObject]@{ Severity = "MEDIUM"; Issue = "Moderate Internet Speed"; Detail = "Download speed $($SpeedTest.DownloadMbps) Mbps indicates moderate network performance." }
+    }
+
+    if ($SpeedTest.Status -eq "Completed" -and (Convert-ToDouble $SpeedTest.PingMs 0) -gt 200) {
+        $issues += [PSCustomObject]@{ Severity = "HIGH"; Issue = "High Speed-Test Latency"; Detail = "Speed test ping is $($SpeedTest.PingMs) ms, indicating poor responsiveness." }
     }
 
     # Check DNS
@@ -318,7 +618,8 @@ function New-HtmlReport {
         [array]$PingResults,
         [PSCustomObject]$SpeedTest,
         [array]$NetProcesses,
-        [array]$NetIssues
+        [array]$NetIssues,
+        [PSCustomObject]$HistoricalInsights = $null
     )
 
     $reportDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -341,6 +642,22 @@ function New-HtmlReport {
         $procRows += "<tr><td>$($pr.PID)</td><td>$($pr.ProcessName)</td><td>$($pr.Connections)</td><td>$($pr.CPU_s) s</td><td>$($pr.Memory_MB) MB</td></tr>"
     }
 
+    $trendRows = ""
+    foreach ($t in @($HistoricalInsights.TrendRows)) {
+        $trendRows += "<tr><td>$($t.Metric)</td><td>$($t.Current)</td><td>$($t.Baseline)</td><td>$($t.Delta)</td><td>$($t.Interpretation)</td></tr>"
+    }
+    if (-not $trendRows) {
+        $trendRows = "<tr><td colspan='5' style='text-align:center;color:#6c757d;'>No historical trend data yet.</td></tr>"
+    }
+
+    $netAppRows = ""
+    foreach ($a in @($HistoricalInsights.AppContributors)) {
+        $netAppRows += "<tr><td>$($a.ProcessName)</td><td>$($a.PID)</td><td>$($a.Connections)</td><td>$($a.MemoryMB) MB</td><td>$($a.Recurrence)</td><td>$($a.Reason)</td></tr>"
+    }
+    if (-not $netAppRows) {
+        $netAppRows = "<tr><td colspan='6' style='text-align:center;color:#6c757d;'>No dominant application contributors identified.</td></tr>"
+    }
+
     $issueRows = ""
     foreach ($i in $NetIssues) {
         $sevColor = switch ($i.Severity) { "HIGH" { "#dc3545" } "MEDIUM" { "#ffc107" } "LOW" { "#17a2b8" } "OK" { "#28a745" } default { "#6c757d" } }
@@ -353,7 +670,8 @@ function New-HtmlReport {
     $maxLoss = if ($PingResults.Count -gt 0) { ($PingResults | Measure-Object -Property PacketLoss -Maximum).Maximum } else { 0 }
     $latColor = if ($avgLatency -gt 200) { "#dc3545" } elseif ($avgLatency -gt 100) { "#ffc107" } else { "#28a745" }
     $lossColor2 = if ($maxLoss -gt 5) { "#dc3545" } elseif ($maxLoss -gt 0) { "#ffc107" } else { "#28a745" }
-    $speedColor = if ($SpeedTest.DownloadMbps -lt 10) { "#ffc107" } else { "#28a745" }
+    $speedColor = if ($SpeedTest.DownloadMbps -lt 10) { "#dc3545" } elseif ($SpeedTest.DownloadMbps -lt 20) { "#ffc107" } else { "#28a745" }
+    $speedStatus = Get-NetworkDownloadStatus -DownloadMbps (Convert-ToDouble $SpeedTest.DownloadMbps 0)
 
     $pingLabels = ($PingResults | ForEach-Object { "'$($_.Target)'" }) -join ","
     $pingData   = ($PingResults | ForEach-Object { if ($_.AvgLatency -lt 9999) { $_.AvgLatency } else { 0 } }) -join ","
@@ -425,7 +743,17 @@ function New-HtmlReport {
         <div class="card">
             <h3>Download Speed</h3>
             <div class="value" style="color:$speedColor;">$($SpeedTest.DownloadMbps) Mbps</div>
-            <div class="sub">$($SpeedTest.Status)</div>
+            <div class="sub">$speedStatus | Method: $($SpeedTest.Method)</div>
+        </div>
+        <div class="card">
+            <h3>Upload Speed</h3>
+            <div class="value">$($SpeedTest.UploadMbps) Mbps</div>
+            <div class="sub">Live speed test upload</div>
+        </div>
+        <div class="card">
+            <h3>Ping (Speed Test)</h3>
+            <div class="value">$($SpeedTest.PingMs) ms</div>
+            <div class="sub">Lower is better</div>
         </div>
         <div class="card">
             <h3>Public IP</h3>
@@ -493,12 +821,45 @@ function New-HtmlReport {
         </table>
     </div>
 
+    <div class="section">
+        <h2>&#x1F680; Live Internet Speed Test</h2>
+        <table>
+            <thead><tr><th>Download (Mbps)</th><th>Upload (Mbps)</th><th>Ping (ms)</th><th>Status</th><th>Method</th></tr></thead>
+            <tbody>
+                <tr>
+                    <td>$($SpeedTest.DownloadMbps)</td>
+                    <td>$($SpeedTest.UploadMbps)</td>
+                    <td>$($SpeedTest.PingMs)</td>
+                    <td>$speedStatus</td>
+                    <td>$($SpeedTest.Method)</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
     <!-- Bandwidth-heavy Processes -->
     <div class="section">
         <h2>&#x1F4CA; Top Network-Active Processes</h2>
         <table>
             <thead><tr><th>PID</th><th>Process Name</th><th>TCP Connections</th><th>CPU (s)</th><th>Memory (MB)</th></tr></thead>
             <tbody>$procRows</tbody>
+        </table>
+    </div>
+
+    <div class="section">
+        <h2>&#x1F4C8; Historical Network Trend (Previous Runs)</h2>
+        <p style="margin-bottom:12px;color:#6c757d;">Trend window analyzed: $($HistoricalInsights.HistoryRuns) previous run(s).</p>
+        <table>
+            <thead><tr><th>Metric</th><th>Current</th><th>Baseline</th><th>Delta</th><th>Interpretation</th></tr></thead>
+            <tbody>$trendRows</tbody>
+        </table>
+    </div>
+
+    <div class="section">
+        <h2>&#x1F4BB; Likely Application Network Contributors</h2>
+        <table>
+            <thead><tr><th>Process</th><th>PID</th><th>Connections</th><th>Memory</th><th>Seen In History</th><th>Why Flagged</th></tr></thead>
+            <tbody>$netAppRows</tbody>
         </table>
     </div>
 
@@ -512,7 +873,7 @@ function New-HtmlReport {
     </div>
 </div>
 <footer>
-    <p>Report Version: 1.0 &nbsp;|&nbsp; Created by: <strong>Tushar Gudde</strong> &nbsp;|&nbsp;
+    <p>Report Version: 2.0 &nbsp;|&nbsp; Created by: <strong>Tushar Gudde</strong> &nbsp;|&nbsp;
     Website: <a href="https://tushargudde.tech" target="_blank">https://tushargudde.tech</a></p>
 </footer>
 <script>
@@ -566,6 +927,38 @@ function New-HtmlReport {
     return $html
 }
 
+function Export-NetworkExcelReport {
+    param(
+        [string]$OutputPath,
+        [array]$Adapters,
+        [array]$PingResults,
+        [PSCustomObject]$SpeedTest,
+        [array]$NetIssues,
+        [array]$NetProcesses
+    )
+
+    try {
+        if (Test-Path $OutputPath) { Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue }
+
+        @($Adapters) | Export-Excel -Path $OutputPath -WorksheetName "Adapters" -AutoSize -FreezeTopRow -BoldTopRow
+        @($PingResults) | Export-Excel -Path $OutputPath -WorksheetName "Ping" -AutoSize -FreezeTopRow -BoldTopRow
+        @([PSCustomObject]@{
+            DownloadMbps = $SpeedTest.DownloadMbps
+            UploadMbps   = $SpeedTest.UploadMbps
+            PingMs       = $SpeedTest.PingMs
+            Status       = $SpeedTest.Status
+            Quality      = (Get-NetworkDownloadStatus -DownloadMbps (Convert-ToDouble $SpeedTest.DownloadMbps 0))
+            Method       = $SpeedTest.Method
+        }) | Export-Excel -Path $OutputPath -WorksheetName "SpeedTest" -AutoSize -FreezeTopRow -BoldTopRow
+        @($NetIssues) | Export-Excel -Path $OutputPath -WorksheetName "Issues" -AutoSize -FreezeTopRow -BoldTopRow
+        @($NetProcesses) | Export-Excel -Path $OutputPath -WorksheetName "TopProcesses" -AutoSize -FreezeTopRow -BoldTopRow
+
+        Write-Log "Excel report saved: $OutputPath" "SUCCESS"
+    } catch {
+        Write-Log "Failed to export Excel report: $_" "WARN"
+    }
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN EXECUTION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -585,6 +978,25 @@ try {
                         -PingResults $pingResults `
                         -SpeedTest   $speedTest)
 
+    $avgLatencyCurrent = if ($pingResults.Count -gt 0) {
+        [math]::Round((@($pingResults | Where-Object { $_.AvgLatency -lt 9999 } | Measure-Object -Property AvgLatency -Average).Average), 1)
+    } else { 0 }
+    $maxLossCurrent = if ($pingResults.Count -gt 0) { (@($pingResults | Measure-Object -Property PacketLoss -Maximum).Maximum) } else { 0 }
+
+    $currentSnapshot = [PSCustomObject]@{
+        Timestamp       = (Get-Date).ToString("o")
+        AvgLatency      = $avgLatencyCurrent
+        MaxPacketLoss   = $maxLossCurrent
+        DownloadMbps    = $speedTest.DownloadMbps
+        ActiveAdapters  = $adapterInfo.Count
+        TopNetProcesses = @($netProcesses | Select-Object -First 8 -Property PID, ProcessName, Connections, Memory_MB)
+    }
+
+    $historicalInsights = Get-NetworkHistoricalInsights -HistoryPath $HistoryFile -CurrentSnapshot $currentSnapshot -NetProcesses $netProcesses
+    if (@($historicalInsights.DerivedIssues).Count -gt 0) {
+        $netIssues = Merge-ObjectArrays -Primary $netIssues -Secondary $historicalInsights.DerivedIssues
+    }
+
     Write-Log "Generating HTML report..." "INFO"
     $htmlContent = New-HtmlReport `
         -Adapters     $adapterInfo `
@@ -592,10 +1004,16 @@ try {
         -PingResults  $pingResults `
         -SpeedTest    $speedTest `
         -NetProcesses $netProcesses `
-        -NetIssues    $netIssues
+        -NetIssues    $netIssues `
+        -HistoricalInsights $historicalInsights
 
     $htmlContent | Out-File -FilePath $ReportFile -Encoding UTF8 -Force
     Write-Log "Report saved: $ReportFile" "SUCCESS"
+
+    $excelFile = [System.IO.Path]::ChangeExtension($ReportFile, ".xlsx")
+    Export-NetworkExcelReport -OutputPath $excelFile -Adapters $adapterInfo -PingResults $pingResults -SpeedTest $speedTest -NetIssues $netIssues -NetProcesses $netProcesses
+
+    Save-HistorySnapshot -Path $HistoryFile -Snapshot $currentSnapshot
 
     # Trigger alert if needed
     $alertScript = Join-Path $PSScriptRoot "NetworkDiagnostics_Alert.ps1"

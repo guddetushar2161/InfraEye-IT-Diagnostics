@@ -1,0 +1,6 @@
+2026-03-16 14:02:34 | NetworkDiagnosticsAlert | INFO | === Network Diagnostics Alert Check Started ===
+2026-03-16 14:02:34 | NetworkDiagnosticsAlert | WARN | ALERT: Download speed 4.89 Mbps (threshold: 10 Mbps)
+2026-03-16 14:02:34 | NetworkDiagnosticsAlert | WARN | 1 alert(s) triggered. Sending email...
+2026-03-16 14:02:36 | NetworkDiagnosticsAlert | ERROR | Failed to send alert email: The SMTP server requires a secure connection or the client was not authenticated. The server response was: 5.7.0 Authentication Required. For more information, go to
+2026-03-16 14:02:36 | NetworkDiagnosticsAlert | SUCCESS | Alert processing completed.
+2026-03-16 14:02:36 | NetworkDiagnosticsAlert | SUCCESS | === Network Diagnostics Alert Check Completed ===

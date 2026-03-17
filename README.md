@@ -5,7 +5,7 @@
 [![PowerShell 5.1+](https://img.shields.io/badge/PowerShell-5.1%2B-blue)](https://docs.microsoft.com/powershell)
 [![PowerShell 7+](https://img.shields.io/badge/PowerShell-7%2B-blue)](https://github.com/PowerShell/PowerShell)
 [![Windows 10/11/Server](https://img.shields.io/badge/Windows-10%20%7C%2011%20%7C%20Server-lightgrey)](https://microsoft.com/windows)
-[![Version](https://img.shields.io/badge/Version-1.0-green)](https://tushargudde.tech)
+[![Version](https://img.shields.io/badge/Version-2.0-green)](https://tushargudde.tech)
 
 Enterprise PowerShell automation toolkit for **device health diagnostics**, **network troubleshooting**, and **infrastructure discovery**. Generates professional HTML dashboards, Excel inventories, and automated email alerts for critical IT issues.
 
@@ -175,6 +175,25 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
 ## 🚀 How to Run Scripts
 
+> **⚠️ Administrator Privileges Recommended**
+>
+> For best results, **run all modules as Administrator**. Elevated privileges unlock:
+> - Full battery report generation (`powercfg /batteryreport`) with hardware identification
+> - Complete ARP table visibility and MAC address resolution (Infrastructure Discovery)
+> - Network adapter diagnostics and TCP port scanning
+> - System performance counters and cleanup analysis
+>
+> **Quick way to launch as Administrator:**
+> ```powershell
+> # Right-click PowerShell → "Run as administrator", then:
+> Set-Location "C:\path\to\InfraEye-IT-Diagnostics"
+> powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\DeviceHealth\DeviceHealth_Main.ps1"
+> ```
+> Or use `Start-Process` to elevate from an existing shell:
+> ```powershell
+> Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PWD\DeviceHealth\DeviceHealth_Main.ps1`""
+> ```
+
 ### Module 1 — Device Health Diagnostics
 
 ```powershell
@@ -317,4 +336,4 @@ This project is provided as-is for IT automation and diagnostics purposes.
 
 **Created by:** [Tushar Gudde](https://tushargudde.tech)  
 **Website:** [https://tushargudde.tech](https://tushargudde.tech)  
-**Version:** 1.0
+**Version:** 2.0

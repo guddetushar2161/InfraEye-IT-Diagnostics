@@ -10,11 +10,12 @@
 .WEBSITE
     https://tushargudde.tech
 .VERSION
-    1.0
+    2.0
 #>
 
 param(
     [string]$ReportFile     = "",
+    [string]$InventoryFile  = "",
     [int]   $DuplicateCount = 0,
     [int]   $UnknownDevices = 0,
     [int]   $DHCPCritical   = 0,
@@ -73,7 +74,7 @@ function Send-AlertEmail {
     param(
         [string]$Subject,
         [string]$Body,
-        [string]$AttachmentPath = ""
+        [string[]]$AttachmentPaths = @()
     )
     try {
         $config = Get-Config
@@ -95,8 +96,9 @@ function Send-AlertEmail {
             $mailParams["Credential"] = $cred
         }
 
-        if ($AttachmentPath -and (Test-Path $AttachmentPath)) {
-            $mailParams["Attachments"] = $AttachmentPath
+        $validAttachments = @($AttachmentPaths | Where-Object { $_ -and (Test-Path $_) })
+        if ($validAttachments.Count -gt 0) {
+            $mailParams["Attachments"] = $validAttachments
         }
 
         Send-MailMessage @mailParams
@@ -136,10 +138,10 @@ function New-AlertBody {
             <thead><tr style='background:#0d6efd;color:#fff;'><th style='padding:8px;text-align:left;'>Severity</th><th style='padding:8px;text-align:left;'>Issue</th><th style='padding:8px;text-align:left;'>Details</th></tr></thead>
             <tbody>$alertRows</tbody>
         </table>
-        <p style='margin-top:15px;font-size:0.9em;color:#6c757d;'>Please review the attached HTML report for full infrastructure details.</p>
+        <p style='margin-top:15px;font-size:0.9em;color:#6c757d;'>Please review the attached HTML report and device inventory spreadsheet for complete infrastructure details.</p>
     </div>
     <div style='background:#f8f9fa;padding:15px 30px;text-align:center;font-size:0.8em;color:#6c757d;'>
-        Report Version: 1.0 | Created by: Tushar Gudde | <a href='https://tushargudde.tech'>https://tushargudde.tech</a>
+        Report Version: 2.0 | Created by: Tushar Gudde | <a href='https://tushargudde.tech'>https://tushargudde.tech</a>
     </div>
 </div>
 </body></html>
@@ -207,11 +209,22 @@ try {
             }
         }
 
+        if (-not $InventoryFile -or !(Test-Path $InventoryFile)) {
+            $ReportDir = Join-Path $PSScriptRoot "Reports"
+            if (Test-Path $ReportDir) {
+                $latestInventory = Get-ChildItem -Path $ReportDir -File |
+                    Where-Object { $_.Name -like "NetworkDevices_*.xlsx" -or $_.Name -like "NetworkDevices_*.csv" } |
+                    Sort-Object LastWriteTime -Descending |
+                    Select-Object -First 1
+                if ($latestInventory) { $InventoryFile = $latestInventory.FullName }
+            }
+        }
+
         $emailBody = New-AlertBody -Alerts $alerts -ComputerName $computerName
         Send-AlertEmail `
             -Subject        "[InfraEye ALERT] Infrastructure Issue Detected on $computerName" `
             -Body           $emailBody `
-            -AttachmentPath $ReportFile
+            -AttachmentPaths @($ReportFile, $InventoryFile)
 
         Write-Log "Alert processing completed." "SUCCESS"
     } else {
