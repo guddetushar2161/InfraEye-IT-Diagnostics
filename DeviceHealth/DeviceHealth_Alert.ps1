@@ -64,6 +64,47 @@ function Get-Config {
     return Get-Content -Path $configPath -Raw | ConvertFrom-Json
 }
 
+function Get-EmailConfig {
+    param(
+        $Config
+    )
+
+    # Backward compatible: support both legacy top-level SMTP keys and new nested "email" object.
+    if ($null -ne $Config.email) {
+        return $Config.email
+    }
+
+    return [PSCustomObject]@{
+        smtp_server   = $Config.smtp_server
+        smtp_port     = $Config.smtp_port
+        from_email    = $Config.from_email
+        to_email      = $Config.to_email
+        smtp_username = $Config.smtp_username
+        smtp_password = $Config.smtp_password
+        enable_ssl    = $Config.enable_ssl
+    }
+}
+
+function Get-DiskFreeThreshold {
+    param(
+        $Thresholds
+    )
+
+    # Preferred key: disk_free_percent (legacy behavior).
+    if ($Thresholds.PSObject.Properties.Name -contains "disk_free_percent") {
+        return [double]$Thresholds.disk_free_percent
+    }
+
+    # Compatibility key: disk_percent means used percent threshold.
+    # Convert to equivalent free threshold (e.g., used 85% => free 15%).
+    if ($Thresholds.PSObject.Properties.Name -contains "disk_percent") {
+        return [double](100 - [double]$Thresholds.disk_percent)
+    }
+
+    # Safe default if neither key exists.
+    return 10
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SEND EMAIL ALERT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -77,21 +118,22 @@ function Send-AlertEmail {
     )
     try {
         $config = Get-Config
+        $email  = Get-EmailConfig -Config $config
 
         $mailParams = @{
-            SmtpServer  = $config.smtp_server
-            Port        = $config.smtp_port
-            From        = $config.from_email
-            To          = $config.to_email
+            SmtpServer  = $email.smtp_server
+            Port        = $email.smtp_port
+            From        = $email.from_email
+            To          = $email.to_email
             Subject     = $Subject
             Body        = $Body
             BodyAsHtml  = $true
-            UseSsl      = $config.enable_ssl
+            UseSsl      = $email.enable_ssl
         }
 
-        if ($config.smtp_username -and $config.smtp_password) {
-            $securePass = ConvertTo-SecureString $config.smtp_password -AsPlainText -Force
-            $cred = New-Object System.Management.Automation.PSCredential($config.smtp_username, $securePass)
+        if ($email.smtp_username -and $email.smtp_password) {
+            $securePass = ConvertTo-SecureString $email.smtp_password -AsPlainText -Force
+            $cred = New-Object System.Management.Automation.PSCredential($email.smtp_username, $securePass)
             $mailParams["Credential"] = $cred
         }
 
@@ -100,7 +142,7 @@ function Send-AlertEmail {
         }
 
         Send-MailMessage @mailParams
-        Write-Log "Alert email sent to $($config.to_email)" "SUCCESS"
+        Write-Log "Alert email sent to $($email.to_email)" "SUCCESS"
     } catch {
         Write-Log "Failed to send alert email: $_" "ERROR"
     }
@@ -154,6 +196,7 @@ try {
 
     $config      = Get-Config
     $thresholds  = $config.alert_thresholds
+    $diskFreeThreshold = Get-DiskFreeThreshold -Thresholds $thresholds
     $computerName = $env:COMPUTERNAME
     $alerts       = @()
 
@@ -199,9 +242,9 @@ try {
         $alerts += [PSCustomObject]@{ Severity = "CRITICAL"; Metric = "RAM Usage"; Value = "$RAM%"; Threshold = ">$($thresholds.ram_percent)%" }
         Write-Log "ALERT: RAM at $RAM% (threshold: $($thresholds.ram_percent)%)" "WARN"
     }
-    if ($DiskFreePct -lt $thresholds.disk_free_percent) {
-        $alerts += [PSCustomObject]@{ Severity = "CRITICAL"; Metric = "Disk Free Space"; Value = "$DiskFreePct%"; Threshold = "<$($thresholds.disk_free_percent)%" }
-        Write-Log "ALERT: Disk free at $DiskFreePct% (threshold: $($thresholds.disk_free_percent)%)" "WARN"
+    if ($DiskFreePct -lt $diskFreeThreshold) {
+        $alerts += [PSCustomObject]@{ Severity = "CRITICAL"; Metric = "Disk Free Space"; Value = "$DiskFreePct%"; Threshold = "<$diskFreeThreshold%" }
+        Write-Log "ALERT: Disk free at $DiskFreePct% (threshold: $diskFreeThreshold%)" "WARN"
     }
     if ($StartupCount -gt $thresholds.startup_apps_max) {
         $alerts += [PSCustomObject]@{ Severity = "WARNING"; Metric = "Startup Programs"; Value = $StartupCount; Threshold = ">$($thresholds.startup_apps_max)" }
