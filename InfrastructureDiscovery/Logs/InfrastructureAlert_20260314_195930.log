@@ -1,0 +1,6 @@
+2026-03-14 19:59:30 | InfrastructureAlert | INFO | === Infrastructure Discovery Alert Check Started ===
+2026-03-14 19:59:30 | InfrastructureAlert | WARN | ALERT: 1 unknown devices detected.
+2026-03-14 19:59:30 | InfrastructureAlert | WARN | 1 infrastructure alert(s) triggered. Sending email...
+2026-03-14 19:59:35 | InfrastructureAlert | ERROR | Failed to send alert email: The SMTP server requires a secure connection or the client was not authenticated. The server response was: 5.7.57 Client not authenticated to send mail. [PN3PR01CA0104.INDPRD01.PROD.OUTLOOK.COM 2026-03-14T14:29:33.919Z 08DE81A4D77ABF28]
+2026-03-14 19:59:35 | InfrastructureAlert | SUCCESS | Alert processing completed.
+2026-03-14 19:59:35 | InfrastructureAlert | SUCCESS | === Infrastructure Discovery Alert Check Completed ===

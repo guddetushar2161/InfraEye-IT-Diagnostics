@@ -1,0 +1,6 @@
+2026-03-14 20:59:41 | InfrastructureAlert | INFO | === Infrastructure Discovery Alert Check Started ===
+2026-03-14 20:59:41 | InfrastructureAlert | WARN | ALERT: 1 unknown devices detected.
+2026-03-14 20:59:41 | InfrastructureAlert | WARN | 1 infrastructure alert(s) triggered. Sending email...
+2026-03-14 20:59:46 | InfrastructureAlert | SUCCESS | Alert email sent to tech.support@mitspl.com
+2026-03-14 20:59:46 | InfrastructureAlert | SUCCESS | Alert processing completed.
+2026-03-14 20:59:46 | InfrastructureAlert | SUCCESS | === Infrastructure Discovery Alert Check Completed ===
