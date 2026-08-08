@@ -1,0 +1,24 @@
+# InfraEye IT Diagnostics v2.1.6.1 - Python Dependencies
+
+# REQUIRED
+psutil>=5.4.0          # System and process utilities (REQUIRED)
+
+# OPTIONAL - For Feature 2 (PDF Export)
+# Install with: pip install weasyprint
+# weasyprint>=55.0      # HTML/CSS to PDF converter (optional)
+
+# OPTIONAL - For development and testing
+# pytest>=6.0           # Testing framework
+# black>=21.0           # Code formatter
+# pylint>=2.0           # Code linter
+
+# Notes:
+# - psutil is REQUIRED for core functionality
+# - weasyprint is OPTIONAL - required only if using --export-pdf CLI flag
+# - vis.js is loaded from CDN, not a Python package
+# 
+# Quick install:
+#   pip install -r requirements.txt
+#
+# If you need PDF export support:
+#   pip install weasyprint

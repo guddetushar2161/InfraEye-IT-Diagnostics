@@ -1,0 +1,20 @@
+# Logs
+Logs/
+*.log
+
+# Reports
+Reports/
+*.html
+*.xlsx
+*.csv
+
+# History
+history/
+*.jsonl
+
+# Credentials
+smtp_credential.xml
+
+# Python
+__pycache__/
+*.pyc

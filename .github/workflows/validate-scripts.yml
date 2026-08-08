@@ -1,0 +1,72 @@
+name: Validate PowerShell Scripts
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Syntax & Quality Check
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+          Install-Module -Name PSScriptAnalyzer -Scope CurrentUser -Force -AllowClobber
+
+      - name: Check PowerShell syntax
+        shell: pwsh
+        run: |
+          $scripts = Get-ChildItem -Path . -Filter "*.ps1" -Recurse
+          $hasErrors = $false
+          foreach ($script in $scripts) {
+              $errors = $null
+              $null = [System.Management.Automation.Language.Parser]::ParseFile(
+                  $script.FullName, [ref]$null, [ref]$errors
+              )
+              if ($errors.Count -gt 0) {
+                  Write-Host "::error file=$($script.FullName)::Syntax errors found:"
+                  $errors | ForEach-Object {
+                      Write-Host "  Line $($_.Extent.StartLineNumber): $($_.Message)"
+                  }
+                  $hasErrors = $true
+              } else {
+                  Write-Host "OK: $($script.Name)"
+              }
+          }
+          if ($hasErrors) { exit 1 }
+
+      - name: Run PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Import-Module PSScriptAnalyzer
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
+          if ($results.Count -gt 0) {
+              $results | ForEach-Object {
+                  Write-Host "::error file=$($_.ScriptPath),line=$($_.Line)::[$($_.RuleName)] $($_.Message)"
+              }
+              Write-Host ""
+              Write-Host "PSScriptAnalyzer found $($results.Count) error(s). Please fix them."
+              exit 1
+          } else {
+              Write-Host "PSScriptAnalyzer: No errors found."
+          }
+          # Report warnings (non-blocking)
+          $warnings = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Warning
+          if ($warnings.Count -gt 0) {
+              Write-Host ""
+              Write-Host "PSScriptAnalyzer warnings ($($warnings.Count) total):"
+              $warnings | ForEach-Object {
+                  Write-Host "  ::warning file=$($_.ScriptPath),line=$($_.Line)::[$($_.RuleName)] $($_.Message)"
+              }
+          }
